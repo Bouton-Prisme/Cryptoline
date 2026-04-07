@@ -1,0 +1,535 @@
+<!doctype html>
+<html lang="fr">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>CryptoTracker (mock)</title>
+
+    <!-- Tailwind CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+
+    <!-- React + ReactDOM (UMD) -->
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+
+    <!-- Recharts (UMD) -->
+    <script src="https://unpkg.com/recharts/umd/Recharts.min.js"></script>
+
+    <!-- Lucide icons (UMD) -->
+    <script src="https://unpkg.com/lucide@latest"></script>
+
+    <style>
+      /* Optionnel: améliore un peu le rendu des select */
+      select option { background: #020617; }
+    </style>
+  </head>
+
+  <body class="min-h-screen">
+    <div id="root"></div>
+
+    <script>
+      // Lucide crée des SVG à partir de data-lucide
+      function mountLucide() {
+        try { lucide.createIcons(); } catch (e) {}
+      }
+    </script>
+
+    <script>
+      const { useMemo, useState, useEffect } = React;
+      const {
+        LineChart,
+        Line,
+        XAxis,
+        YAxis,
+        CartesianGrid,
+        ResponsiveContainer,
+        Tooltip,
+      } = Recharts;
+
+      const CRYPTOS = [
+        { symbol: "XMR", name: "Monero", price: 165.32, change7d: 3.45 },
+        { symbol: "BTC", name: "Bitcoin", price: 43250.12, change7d: 1.12 },
+        { symbol: "ETH", name: "Ethereum", price: 2321.44, change7d: -0.84 },
+      ];
+
+      const chartBase = [
+        { day: "Lun", v: 168 },
+        { day: "Mar", v: 168 },
+        { day: "Mer", v: 169 },
+        { day: "Jeu", v: 166 },
+        { day: "Ven", v: 165 },
+        { day: "Sam", v: 170 },
+        { day: "Dim", v: 171 },
+      ];
+
+      function formatMoney(n, currency = "USD") {
+        try {
+          return new Intl.NumberFormat("fr-FR", {
+            style: "currency",
+            currency,
+            maximumFractionDigits: 2,
+          }).format(n);
+        } catch {
+          return `$${Number(n).toFixed(2)}`;
+        }
+      }
+
+      function Pill({ children, tone = "green" }) {
+        const base =
+          "inline-flex items-center gap-2 rounded-full px-3 py-1 text-xs font-semibold backdrop-blur";
+        const styles =
+          tone === "green"
+            ? "bg-emerald-400/10 text-emerald-300 ring-1 ring-emerald-400/20"
+            : "bg-rose-400/10 text-rose-300 ring-1 ring-rose-400/20";
+        return React.createElement("span", { className: base + " " + styles }, children);
+      }
+
+      function GlassCard({ className = "", children }) {
+        return React.createElement(
+          "div",
+          {
+            className:
+              "rounded-2xl border border-white/10 bg-white/[0.03] backdrop-blur-xl " +
+              "shadow-[0_20px_60px_rgba(0,0,0,0.45)] " +
+              className,
+          },
+          children
+        );
+      }
+
+      function CustomTooltip({ active, payload, label }) {
+        if (!active || !payload || !payload.length) return null;
+        const val = payload[0].value;
+        return React.createElement(
+          "div",
+          {
+            className:
+              "rounded-xl border border-white/10 bg-slate-950/70 px-3 py-2 text-xs text-slate-100 backdrop-blur",
+          },
+          React.createElement("div", { className: "text-slate-300" }, label),
+          React.createElement(
+            "div",
+            { className: "mt-1 font-semibold text-cyan-300" },
+            String(val)
+          )
+        );
+      }
+
+      function App() {
+        const [selected, setSelected] = useState("XMR");
+        const [amount, setAmount] = useState(10.5);
+        const [alertInput, setAlertInput] = useState("");
+        const [alerts, setAlerts] = useState([{ id: 1, type: "sell", value: 77 }]);
+
+        const coin = useMemo(
+          () => CRYPTOS.find((c) => c.symbol === selected) || CRYPTOS[0],
+          [selected]
+        );
+
+        const totalValue = useMemo(() => amount * coin.price, [amount, coin.price]);
+
+        const chartData = useMemo(() => {
+          const scale = coin.price / 170;
+          return chartBase.map((d, i) => ({
+            ...d,
+            v: Math.round(d.v * scale + (i === 4 ? -1 : 0)),
+          }));
+        }, [coin.price]);
+
+        const isPositive = coin.change7d >= 0;
+
+        function addAlert() {
+          const n = Number(String(alertInput).replace(",", "."));
+          if (!Number.isFinite(n)) return;
+          setAlerts((prev) => [{ id: Date.now(), type: "sell", value: n }, ...prev]);
+          setAlertInput("");
+        }
+
+        function removeAlert(id) {
+          setAlerts((prev) => prev.filter((a) => a.id !== id));
+        }
+
+        useEffect(() => {
+          mountLucide();
+        });
+
+        return React.createElement(
+          "div",
+          { className: "min-h-screen w-full" },
+
+          // Background layers
+          React.createElement("div", { className: "fixed inset-0 -z-10 bg-[#040614]" }),
+          React.createElement("div", {
+            className: "fixed inset-0 -z-10 opacity-100",
+            style: {
+              background:
+                "radial-gradient(1200px 600px at 20% 0%, rgba(26,60,140,0.55), transparent 60%)," +
+                "radial-gradient(900px 500px at 80% 10%, rgba(0,200,255,0.18), transparent 55%)," +
+                "radial-gradient(1000px 700px at 50% 100%, rgba(10,20,50,0.9), #040614 70%)",
+            },
+          }),
+
+          // Content
+          React.createElement(
+            "div",
+            { className: "mx-auto max-w-6xl px-6 pt-10" },
+
+            // Top bar
+            React.createElement(
+              "div",
+              { className: "flex items-center justify-between" },
+
+              // Left brand
+              React.createElement(
+                "div",
+                { className: "flex items-center gap-3" },
+                React.createElement(
+                  "div",
+                  {
+                    className:
+                      "grid h-11 w-11 place-items-center rounded-full bg-cyan-400/15 ring-1 ring-cyan-300/20",
+                  },
+                  React.createElement("i", {
+                    "data-lucide": "trending-up",
+                    class: "h-5 w-5 text-cyan-300",
+                  })
+                ),
+                React.createElement(
+                  "div",
+                  null,
+                  React.createElement(
+                    "div",
+                    { className: "text-lg font-bold tracking-tight text-white" },
+                    "CryptoTracker"
+                  ),
+                  React.createElement(
+                    "div",
+                    { className: "text-xs text-slate-400" },
+                    "Suivez vos investissements crypto"
+                  )
+                )
+              ),
+
+              // Right select
+              React.createElement(
+                "div",
+                { className: "relative" },
+                React.createElement(
+                  "div",
+                  {
+                    className:
+                      "flex items-center gap-3 rounded-2xl border border-cyan-300/25 bg-white/[0.04] px-4 py-3 " +
+                      "shadow-[0_10px_30px_rgba(0,0,0,0.35)] backdrop-blur-xl",
+                  },
+                  React.createElement(
+                    "div",
+                    {
+                      className:
+                        "grid h-8 w-8 place-items-center rounded-xl bg-cyan-400/10 ring-1 ring-cyan-300/20",
+                    },
+                    React.createElement(
+                      "span",
+                      { className: "text-sm font-bold text-cyan-200" },
+                      "$"
+                    )
+                  ),
+                  React.createElement(
+                    "select",
+                    {
+                      value: selected,
+                      onChange: (e) => setSelected(e.target.value),
+                      className:
+                        "w-[220px] appearance-none bg-transparent text-sm font-semibold text-slate-100 outline-none",
+                    },
+                    CRYPTOS.map((c) =>
+                      React.createElement(
+                        "option",
+                        { key: c.symbol, value: c.symbol, className: "bg-slate-950" },
+                        `${c.symbol} - ${c.name}`
+                      )
+                    )
+                  ),
+                  React.createElement("div", { className: "pointer-events-none text-slate-400" }, "▾")
+                )
+              )
+            ),
+
+            React.createElement("div", { className: "mt-8 h-px w-full bg-white/10" }),
+
+            // Main grid
+            React.createElement(
+              "div",
+              { className: "mt-10 grid grid-cols-1 gap-8 lg:grid-cols-2" },
+
+              // Left column
+              React.createElement(
+                "div",
+                { className: "space-y-8" },
+
+                // Balance card
+                React.createElement(
+                  GlassCard,
+                  { className: "p-8" },
+                  React.createElement(
+                    "div",
+                    { className: "flex items-start justify-between" },
+                    React.createElement(
+                      "div",
+                      null,
+                      React.createElement(
+                        "div",
+                        { className: "text-2xl font-extrabold tracking-wide text-white" },
+                        coin.name.toUpperCase()
+                      ),
+                      React.createElement(
+                        "div",
+                        { className: "mt-1 text-xs text-slate-400" },
+                        "Balance actuelle"
+                      )
+                    ),
+                    React.createElement(
+                      Pill,
+                      { tone: isPositive ? "green" : "red" },
+                      React.createElement("i", { "data-lucide": "arrow-up-right", class: "h-4 w-4" }),
+                      `${isPositive ? "+" : ""}${coin.change7d.toFixed(2)}%`
+                    )
+                  ),
+
+                  React.createElement(
+                    "div",
+                    { className: "mt-8" },
+                    React.createElement(
+                      "div",
+                      { className: "text-sm font-semibold text-slate-200" },
+                      "Quantité détenue"
+                    ),
+                    React.createElement(
+                      "div",
+                      { className: "mt-3" },
+                      React.createElement("input", {
+                        value: String(amount).replace(".", ","),
+                        onChange: (e) => {
+                          const raw = e.target.value.replace(",", ".");
+                          const n = Number(raw);
+                          if (raw === "" || raw === "." || raw === ",") return setAmount(0);
+                          if (Number.isFinite(n)) setAmount(n);
+                        },
+                        className:
+                          "w-full rounded-2xl border border-white/10 bg-white/[0.04] px-5 py-4 text-sm text-slate-100 outline-none " +
+                          "placeholder:text-slate-500 focus:border-cyan-300/40 focus:ring-2 focus:ring-cyan-300/10",
+                        placeholder: "0",
+                      })
+                    ),
+
+                    React.createElement(
+                      "div",
+                      { className: "mt-8 grid grid-cols-2 gap-6" },
+                      React.createElement(
+                        "div",
+                        null,
+                        React.createElement("div", { className: "text-xs text-slate-400" }, "Prix actuel"),
+                        React.createElement(
+                          "div",
+                          { className: "mt-2 text-xl font-bold text-cyan-300" },
+                          formatMoney(coin.price, "USD")
+                        )
+                      ),
+                      React.createElement(
+                        "div",
+                        null,
+                        React.createElement("div", { className: "text-xs text-slate-400" }, "Valeur totale"),
+                        React.createElement(
+                          "div",
+                          { className: "mt-2 text-xl font-bold text-slate-100" },
+                          formatMoney(totalValue, "USD")
+                        )
+                      )
+                    )
+                  )
+                ),
+
+                // Alerts card
+                React.createElement(
+                  GlassCard,
+                  { className: "p-8" },
+                  React.createElement(
+                    "div",
+                    { className: "flex items-center gap-3" },
+                    React.createElement(
+                      "div",
+                      {
+                        className:
+                          "grid h-10 w-10 place-items-center rounded-xl bg-cyan-400/10 ring-1 ring-cyan-300/20",
+                      },
+                      React.createElement("i", { "data-lucide": "bell", class: "h-5 w-5 text-cyan-300" })
+                    ),
+                    React.createElement(
+                      "div",
+                      null,
+                      React.createElement("div", { className: "text-lg font-bold text-white" }, "Alertes de prix"),
+                      React.createElement(
+                        "div",
+                        { className: "text-xs text-slate-400" },
+                        "Soyez notifié des opportunités"
+                      )
+                    )
+                  ),
+
+                  React.createElement(
+                    "div",
+                    { className: "mt-6 flex items-center gap-3" },
+                    React.createElement("input", {
+                      value: alertInput,
+                      onChange: (e) => setAlertInput(e.target.value),
+                      placeholder: "Prix de l'alerte",
+                      className:
+                        "flex-1 rounded-2xl border border-white/10 bg-white/[0.04] px-5 py-4 text-sm text-slate-100 outline-none " +
+                        "placeholder:text-slate-500 focus:border-cyan-300/40 focus:ring-2 focus:ring-cyan-300/10",
+                    }),
+
+                    React.createElement(
+                      "button",
+                      {
+                        type: "button",
+                        className:
+                          "grid h-11 w-11 place-items-center rounded-xl border border-white/10 bg-white/[0.04] text-slate-200 hover:bg-white/[0.06]",
+                        title: "Inverser (placeholder)",
+                      },
+                      React.createElement("i", { "data-lucide": "arrow-left-right", class: "h-5 w-5" })
+                    ),
+
+                    React.createElement(
+                      "button",
+                      {
+                        type: "button",
+                        className:
+                          "grid h-11 w-11 place-items-center rounded-xl border border-cyan-300/25 bg-cyan-400/10 text-cyan-200 hover:bg-cyan-400/15",
+                        title: "Action (placeholder)",
+                      },
+                      React.createElement("i", { "data-lucide": "trending-up", class: "h-5 w-5" })
+                    ),
+
+                    React.createElement(
+                      "button",
+                      {
+                        type: "button",
+                        onClick: addAlert,
+                        className:
+                          "grid h-11 w-11 place-items-center rounded-xl border border-cyan-300/25 bg-cyan-400/10 text-cyan-200 hover:bg-cyan-400/15",
+                        title: "Ajouter",
+                      },
+                      React.createElement("i", { "data-lucide": "plus", class: "h-5 w-5" })
+                    )
+                  ),
+
+                  React.createElement(
+                    "div",
+                    { className: "mt-6 space-y-3" },
+                    alerts.map((a) =>
+                      React.createElement(
+                        "div",
+                        {
+                          key: a.id,
+                          className:
+                            "flex items-center justify-between rounded-2xl border border-white/10 bg-white/[0.03] px-5 py-4",
+                        },
+                        React.createElement(
+                          "div",
+                          null,
+                          React.createElement("div", { className: "text-xs text-slate-400" }, "Vendre"),
+                          React.createElement(
+                            "div",
+                            { className: "mt-1 text-lg font-bold text-slate-100" },
+                            formatMoney(a.value, "USD")
+                          )
+                        ),
+                        React.createElement(
+                          "button",
+                          {
+                            type: "button",
+                            onClick: () => removeAlert(a.id),
+                            className:
+                              "grid h-9 w-9 place-items-center rounded-xl border border-white/10 bg-white/[0.03] text-slate-300 hover:bg-white/[0.06]",
+                            title: "Supprimer",
+                          },
+                          React.createElement("i", { "data-lucide": "x", class: "h-4 w-4" })
+                        )
+                      )
+                    ),
+                    alerts.length === 0 &&
+                      React.createElement(
+                        "div",
+                        {
+                          className:
+                            "rounded-2xl border border-white/10 bg-white/[0.02] px-5 py-6 text-sm text-slate-400",
+                        },
+                        "Aucune alerte pour le moment."
+                      )
+                  )
+                )
+              ),
+
+              // Right column
+              React.createElement(
+                "div",
+                null,
+                React.createElement(
+                  GlassCard,
+                  { className: "p-8" },
+                  React.createElement(
+                    "div",
+                    null,
+                    React.createElement("div", { className: "text-lg font-bold text-white" }, "Évolution du cours"),
+                    React.createElement("div", { className: "mt-1 text-xs text-slate-400" }, "7 derniers jours")
+                  ),
+                  React.createElement(
+                    "div",
+                    { className: "mt-6 h-[340px] w-full" },
+                    React.createElement(
+                      ResponsiveContainer,
+                      { width: "100%", height: "100%" },
+                      React.createElement(
+                        LineChart,
+                        { data: chartData, margin: { top: 10, right: 10, left: 10, bottom: 0 } },
+                        React.createElement(CartesianGrid, {
+                          strokeDasharray: "4 6",
+                          stroke: "rgba(255,255,255,0.08)",
+                        }),
+                        React.createElement(XAxis, {
+                          dataKey: "day",
+                          tick: { fill: "rgba(226,232,240,0.65)", fontSize: 12 },
+                          axisLine: { stroke: "rgba(255,255,255,0.12)" },
+                          tickLine: false,
+                        }),
+                        React.createElement(YAxis, {
+                          tick: { fill: "rgba(226,232,240,0.65)", fontSize: 12 },
+                          axisLine: { stroke: "rgba(255,255,255,0.12)" },
+                          tickLine: false,
+                          domain: ["auto", "auto"],
+                        }),
+                        React.createElement(Tooltip, { content: React.createElement(CustomTooltip, null) }),
+                        React.createElement(Line, {
+                          type: "monotone",
+                          dataKey: "v",
+                          stroke: "rgba(34,211,238,0.95)",
+                          strokeWidth: 3,
+                          dot: false,
+                          activeDot: { r: 5 },
+                        })
+                      )
+                    )
+                  )
+                )
+              )
+            ),
+
+            React.createElement("div", { className: "h-12" })
+          )
+        );
+      }
+
+      const root = ReactDOM.createRoot(document.getElementById("root"));
+      root.render(React.createElement(App));
+    </script>
+  </body>
+</html>
