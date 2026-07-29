@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 
-const DEFAULT_ENDPOINT = process.env.REACT_APP_CUSTODY_ENDPOINT || null;
+const DEFAULT_ENDPOINT = process.env.REACT_APP_CUSTODY_ENDPOINT || "/api/custody";
 
-export default function useCustodianHoldings({ account, symbols = [] } = {}) {
+export default function useCustodianHoldings({ account, symbols = [], endpoint } = {}) {
   const [positions, setPositions] = useState([]);
   const [holdingsMap, setHoldingsMap] = useState(null);
   const [status, setStatus] = useState("idle");
@@ -19,7 +19,9 @@ export default function useCustodianHoldings({ account, symbols = [] } = {}) {
   }, []);
 
   useEffect(() => {
-    if (!account && !DEFAULT_ENDPOINT) {
+    const custodyEndpoint = endpoint || DEFAULT_ENDPOINT;
+
+    if (!custodyEndpoint) {
       setPositions([]);
       setHoldingsMap(null);
       setStatus("idle");
@@ -30,34 +32,20 @@ export default function useCustodianHoldings({ account, symbols = [] } = {}) {
     const controller = new AbortController();
 
     const load = async () => {
-      if (!account && DEFAULT_ENDPOINT) return;
       setStatus((prev) => (prev === "ready" ? "refreshing" : "loading"));
       setError(null);
       try {
-        let payload;
-        if (DEFAULT_ENDPOINT) {
-          const params = new URLSearchParams();
-          if (account) params.append("account", account);
-          if (normalizedSymbols.length) params.append("symbols", normalizedSymbols.join(","));
-          const response = await fetch(`${DEFAULT_ENDPOINT}?${params.toString()}`, {
-            headers: { Accept: "application/json" },
-            signal: controller.signal,
-          });
-          if (!response.ok) {
-            throw new Error(`Custodian API ${response.status}`);
-          }
-          payload = await response.json();
-        } else {
-          payload = {
-            positions: normalizedSymbols.map((symbol, index) => ({
-              symbol,
-              amount: Math.max(0, Number((Math.cos(index + 1) + 1).toFixed(3))),
-              cost_basis: Math.max(100, (index + 1) * 4500),
-              provider: "Sandbox Custodian",
-              updated_at: new Date(Date.now() - index * 60000).toISOString(),
-            })),
-          };
+        const params = new URLSearchParams();
+        if (account) params.append("account", account);
+        if (normalizedSymbols.length) params.append("symbols", normalizedSymbols.join(","));
+        const response = await fetch(`${custodyEndpoint}?${params.toString()}`, {
+          headers: { Accept: "application/json" },
+          signal: controller.signal,
+        });
+        if (!response.ok) {
+          throw new Error(`Custodian API ${response.status}`);
         }
+        const payload = await response.json();
 
         if (cancelled) return;
 
@@ -104,7 +92,7 @@ export default function useCustodianHoldings({ account, symbols = [] } = {}) {
       cancelled = true;
       controller.abort();
     };
-  }, [account, normalizedSymbols, refreshTick]);
+  }, [account, endpoint, normalizedSymbols, refreshTick]);
 
   return {
     positions,

@@ -23,8 +23,25 @@ function useStoredState(key, initialValue) {
 
 const AppPreferencesContext = createContext(null);
 
+const DEFAULT_ACCOUNT_SETTINGS = {
+  profileName: "",
+  email: "",
+  pushEnabled: false,
+  defaultWalletAddress: "",
+  defaultNetwork: "ethereum",
+  custodyProvider: "",
+  custodyAccountId: "",
+  custodyEndpoint: "",
+  alertsEndpoint: "",
+  supabaseUrl: "",
+  supabaseAlertsTable: "alerts",
+  dcaStable: "USDC",
+  dcaExecutionEndpoint: "",
+  dcaScheduleEndpoint: "",
+  riskProfile: "balanced",
+};
+
 export function AppPreferencesProvider({ children }) {
-  const [theme, setTheme] = useStoredState("cryptoline-theme", "ocean");
   const [selected, setSelected] = useStoredState("cryptoline-selected", "BTC");
   const [holdings, setHoldings] = useStoredState("cryptoline-holdings", {
     BTC: 0.45,
@@ -33,16 +50,32 @@ export function AppPreferencesProvider({ children }) {
     SOL: 20,
   });
   const [watchlist, setWatchlist] = useStoredState("cryptoline-watchlist", ["BTC", "ETH"]);
+  const [accountSettings, setAccountSettings] = useStoredState(
+    "cryptoline-account-settings",
+    DEFAULT_ACCOUNT_SETTINGS,
+  );
+
+  const updateAccountSettings = (patch) => {
+    setAccountSettings((current) => ({
+      ...DEFAULT_ACCOUNT_SETTINGS,
+      ...current,
+      ...patch,
+    }));
+  };
 
   const value = {
-    theme,
-    setTheme,
     selected,
     setSelected,
     holdings,
     setHoldings,
     watchlist,
     setWatchlist,
+    accountSettings: {
+      ...DEFAULT_ACCOUNT_SETTINGS,
+      ...accountSettings,
+    },
+    setAccountSettings,
+    updateAccountSettings,
   };
 
   return <AppPreferencesContext.Provider value={value}>{children}</AppPreferencesContext.Provider>;

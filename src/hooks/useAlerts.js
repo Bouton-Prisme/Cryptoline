@@ -27,8 +27,9 @@ function normalizeRecord(record) {
   };
 }
 
-export default function useAlerts({ symbol } = {}) {
+export default function useAlerts({ symbol, endpoint: endpointOverride } = {}) {
   const [alerts, setAlerts] = useState([]);
+  const [events, setEvents] = useState([]);
   const [status, setStatus] = useState("idle");
   const [error, setError] = useState(null);
   const [refreshTick, setRefreshTick] = useState(0);
@@ -36,8 +37,16 @@ export default function useAlerts({ symbol } = {}) {
   const isSupabaseReady = Boolean(SUPABASE_URL && SUPABASE_KEY);
 
   const endpoint = useMemo(() => {
+    if (endpointOverride) return endpointOverride;
     return isSupabaseReady ? `${SUPABASE_URL}/rest/v1/${SUPABASE_TABLE}` : FALLBACK_ENDPOINT;
-  }, [isSupabaseReady]);
+  }, [endpointOverride, isSupabaseReady]);
+
+  const eventsEndpoint = useMemo(() => {
+    if (endpointOverride?.includes("/api/alerts")) {
+      return endpointOverride.replace("/api/alerts", "/api/alert-events");
+    }
+    return "/api/alert-events";
+  }, [endpointOverride]);
 
   const headers = useMemo(() => {
     const base = {
@@ -95,9 +104,28 @@ export default function useAlerts({ symbol } = {}) {
     }
   }, [buildListUrl, headers]);
 
+  const fetchEvents = useCallback(async () => {
+    try {
+      const eventUrl = symbol
+        ? `${eventsEndpoint}?${new URLSearchParams({ symbol }).toString()}`
+        : eventsEndpoint;
+      const response = await fetch(eventUrl, {
+        headers: { Accept: "application/json" },
+      });
+      if (!response.ok && response.status !== 204) {
+        throw new Error(`Alert events API ${response.status}`);
+      }
+      const payload = response.status === 204 ? [] : await response.json();
+      setEvents(Array.isArray(payload) ? payload : []);
+    } catch (err) {
+      console.error("[useAlerts] events fetch error", err);
+    }
+  }, [eventsEndpoint, symbol]);
+
   useEffect(() => {
     fetchAlerts();
-  }, [fetchAlerts, refreshTick]);
+    fetchEvents();
+  }, [fetchAlerts, fetchEvents, refreshTick]);
 
   const createAlert = useCallback(
     async (payload) => {
@@ -158,12 +186,27 @@ export default function useAlerts({ symbol } = {}) {
     [endpoint, headers, isSupabaseReady]
   );
 
+  const runCheck = useCallback(async () => {
+    const response = await fetch("/api/alerts/check", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+    });
+    if (!response.ok) {
+      throw new Error(`Alert worker ${response.status}`);
+    }
+    const result = await response.json();
+    refresh();
+    return result;
+  }, [refresh]);
+
   return {
     alerts,
+    events,
     status,
     error,
     refresh,
     createAlert,
     deleteAlert,
+    runCheck,
   };
 }

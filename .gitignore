@@ -1,5 +1,7 @@
 node_modules/
 build/
+.env.local
+server/data/*.json
 
 # OS files
 .DS_Store

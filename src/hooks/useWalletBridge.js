@@ -1,75 +1,258 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import EthereumProvider from "@walletconnect/ethereum-provider";
+import { ethers } from "ethers";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-const WALLET_CONNECTORS = [
-  {
-    id: "walletconnect",
-    label: "WalletConnect",
-    description: "Mobile / QR multi-chain",
-  },
-  {
-    id: "ledger-live",
-    label: "Ledger Live",
-    description: "Desktop Ledger / Bluetooth",
-  },
-];
+const WALLETCONNECT_PROJECT_ID =
+  process.env.REACT_APP_WALLETCONNECT_PROJECT_ID ||
+  "61f8ac0e1e9025fe80daaede38878711";
 
-const DEFAULT_BALANCES = {
-  BTC: 0.42,
-  ETH: 2.1,
-  SOL: 35,
-  USDC: 1200,
+const DEFAULT_CHAIN_ID = 1;
+const SUPPORTED_CHAINS = [1, 137, 42161, 8453];
+
+const CHAIN_NAMES = {
+  1: "Ethereum",
+  137: "Polygon",
+  42161: "Arbitrum",
+  8453: "Base",
 };
 
-const DEFAULT_ACCOUNT = "0x9b6e...c74d";
-const DEFAULT_NETWORK = "Ethereum";
+const TOKEN_CONTRACTS = {
+  1: {
+    USDC: { address: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", decimals: 6 },
+    BTC: { address: "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599", decimals: 8 },
+  },
+  137: {
+    USDC: { address: "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174", decimals: 6 },
+  },
+  42161: {
+    USDC: { address: "0xaf88d065e77c8cC2239327C5EDb3A432268e5831", decimals: 6 },
+    BTC: { address: "0x2f2a2543B76A4166549F7aaB2e75Bef0aefC5B0f", decimals: 8 },
+  },
+  8453: {
+    USDC: { address: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", decimals: 6 },
+  },
+};
+
+const ERC20_ABI = [
+  "function balanceOf(address owner) view returns (uint256)",
+  "function decimals() view returns (uint8)",
+  "function allowance(address owner, address spender) view returns (uint256)",
+  "function approve(address spender, uint256 amount) returns (bool)",
+];
+
+const NATIVE_TOKEN_ADDRESSES = new Set([
+  "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+  "0x0000000000000000000000000000000000000000",
+]);
+
+function toDecimalChainId(chainId) {
+  if (!chainId) return DEFAULT_CHAIN_ID;
+  if (typeof chainId === "number") return chainId;
+  if (typeof chainId === "string" && chainId.startsWith("0x")) {
+    return parseInt(chainId, 16);
+  }
+  return Number(chainId) || DEFAULT_CHAIN_ID;
+}
+
+function hasInjectedProvider() {
+  return typeof window !== "undefined" && Boolean(window.ethereum);
+}
+
+async function createWalletConnectProvider() {
+  const provider = await EthereumProvider.init({
+    projectId: WALLETCONNECT_PROJECT_ID,
+    chains: [DEFAULT_CHAIN_ID],
+    optionalChains: SUPPORTED_CHAINS,
+    showQrModal: true,
+    methods: ["eth_sendTransaction", "personal_sign", "eth_signTypedData"],
+    optionalMethods: [
+      "eth_requestAccounts",
+      "eth_accounts",
+      "eth_chainId",
+      "wallet_switchEthereumChain",
+      "wallet_addEthereumChain",
+    ],
+    events: ["accountsChanged", "chainChanged", "disconnect"],
+    optionalEvents: ["connect", "message"],
+    metadata: {
+      name: "CryptoLine",
+      description: "CryptoLine portfolio dashboard",
+      url: window.location.origin,
+      icons: [`${window.location.origin}/cryptolinelogo.png`],
+    },
+  });
+
+  return provider;
+}
+
+async function requestAccounts(provider, connectorId) {
+  if (connectorId === "injected") {
+    return provider.request({ method: "eth_requestAccounts" });
+  }
+
+  const accounts = await provider.connect();
+  return Array.isArray(accounts) ? accounts : provider.accounts || [];
+}
+
+async function readBalances(provider, account, symbols) {
+  if (!provider || !account) return {};
+
+  const web3Provider = new ethers.providers.Web3Provider(provider, "any");
+  const network = await web3Provider.getNetwork();
+  const chainId = Number(network.chainId || DEFAULT_CHAIN_ID);
+  const nextBalances = {};
+  const wanted = new Set((symbols || []).map((symbol) => symbol?.toUpperCase()).filter(Boolean));
+
+  if (wanted.has("ETH")) {
+    const balance = await web3Provider.getBalance(account);
+    nextBalances.ETH = Number(ethers.utils.formatEther(balance));
+  }
+
+  const tokenContracts = TOKEN_CONTRACTS[chainId] || {};
+  await Promise.all(
+    Array.from(wanted).map(async (symbol) => {
+      const token = tokenContracts[symbol];
+      if (!token) {
+        if (nextBalances[symbol] === undefined) nextBalances[symbol] = 0;
+        return;
+      }
+      try {
+        const contract = new ethers.Contract(token.address, ERC20_ABI, web3Provider);
+        const rawBalance = await contract.balanceOf(account);
+        nextBalances[symbol] = Number(ethers.utils.formatUnits(rawBalance, token.decimals));
+      } catch (err) {
+        console.warn(`[useWalletBridge] ${symbol} balance unavailable`, err);
+        nextBalances[symbol] = 0;
+      }
+    }),
+  );
+
+  if (!wanted.has("USDC") && tokenContracts.USDC) {
+    try {
+      const contract = new ethers.Contract(tokenContracts.USDC.address, ERC20_ABI, web3Provider);
+      const rawBalance = await contract.balanceOf(account);
+      nextBalances.USDC = Number(ethers.utils.formatUnits(rawBalance, tokenContracts.USDC.decimals));
+    } catch (err) {
+      console.warn("[useWalletBridge] USDC balance unavailable", err);
+    }
+  }
+
+  return nextBalances;
+}
 
 export default function useWalletBridge({ symbols = [] } = {}) {
   const [connectorId, setConnectorId] = useState(null);
   const [status, setStatus] = useState("disconnected");
   const [account, setAccount] = useState(null);
-  const [network, setNetwork] = useState(DEFAULT_NETWORK);
+  const [network, setNetwork] = useState(null);
+  const [chainId, setChainId] = useState(null);
   const [balances, setBalances] = useState({});
   const [error, setError] = useState(null);
   const [refreshTick, setRefreshTick] = useState(0);
-
-  const endpoint = process.env.REACT_APP_WALLET_BRIDGE_ENDPOINT || null;
+  const providerRef = useRef(null);
 
   const normalizedSymbols = useMemo(() => {
-    return Array.from(new Set((symbols || []).map((symbol) => symbol?.toUpperCase()).filter(Boolean)));
+    return Array.from(
+      new Set((symbols || []).map((symbol) => symbol?.toUpperCase()).filter(Boolean)),
+    );
   }, [symbols]);
 
-  const normalizeBalances = useCallback(
-    (payload) => {
-      const next = {};
-      normalizedSymbols.forEach((symbol) => {
-        const value = payload?.[symbol];
-        if (value === undefined || value === null) {
-          next[symbol] = 0;
-          return;
-        }
-        next[symbol] = Number(value) || 0;
-      });
-      if (!normalizedSymbols.includes("USDC") && payload?.USDC) {
-        next.USDC = Number(payload.USDC) || 0;
-      }
-      return next;
+  const connectors = useMemo(() => {
+    const base = [
+      {
+        id: "walletconnect",
+        label: "WalletConnect",
+        description: "Mobile / QR multi-chain",
+      },
+      {
+        id: "ledger-live",
+        label: "Ledger Live",
+        description: "Ledger Wallet via WalletConnect",
+      },
+    ];
+
+    if (hasInjectedProvider()) {
+      return [
+        {
+          id: "injected",
+          label: window.ethereum?.isMetaMask ? "MetaMask" : "Navigateur",
+          description: "Extension EVM injectee",
+        },
+        ...base,
+      ];
+    }
+
+    return base;
+  }, []);
+
+  const loadBalances = useCallback(
+    async (provider, nextAccount = account) => {
+      if (!provider || !nextAccount) return;
+      const nextBalances = await readBalances(provider, nextAccount, normalizedSymbols);
+      setBalances(nextBalances);
     },
-    [normalizedSymbols]
+    [account, normalizedSymbols],
   );
 
-  const mockPayload = useCallback(() => {
-    const balancesPayload = { ...DEFAULT_BALANCES };
-    normalizedSymbols.forEach((symbol, index) => {
-      if (balancesPayload[symbol] === undefined) {
-        balancesPayload[symbol] = Number((Math.sin(index + 1) + 1).toFixed(2));
+  const refresh = useCallback(() => {
+    setRefreshTick((tick) => tick + 1);
+  }, []);
+
+  const clearWalletState = useCallback(() => {
+    providerRef.current = null;
+    setAccount(null);
+    setConnectorId(null);
+    setNetwork(null);
+    setChainId(null);
+    setBalances({});
+    setStatus("disconnected");
+    setError(null);
+  }, []);
+
+  const disconnect = useCallback(async () => {
+    try {
+      const provider = providerRef.current;
+      if (provider?.disconnect) {
+        await provider.disconnect();
       }
-    });
-    return {
-      account: DEFAULT_ACCOUNT,
-      balances: balancesPayload,
-      network: DEFAULT_NETWORK,
-    };
-  }, [normalizedSymbols]);
+    } catch (err) {
+      console.warn("[useWalletBridge] disconnect warning", err);
+    } finally {
+      clearWalletState();
+    }
+  }, [clearWalletState]);
+
+  const attachProviderEvents = useCallback(
+    (provider) => {
+      if (!provider?.on) return;
+
+      provider.on("accountsChanged", (accounts) => {
+        const nextAccount = accounts?.[0] || null;
+        setAccount(nextAccount);
+        if (nextAccount) {
+          loadBalances(provider, nextAccount).catch((err) => {
+            console.error("[useWalletBridge] balance refresh error", err);
+            setError(err instanceof Error ? err : new Error("Balance refresh error"));
+          });
+        }
+      });
+
+      provider.on("chainChanged", (chainId) => {
+        const nextChainId = toDecimalChainId(chainId);
+        setChainId(nextChainId);
+        setNetwork(CHAIN_NAMES[nextChainId] || `Chain ${nextChainId}`);
+        loadBalances(provider).catch((err) => {
+          console.error("[useWalletBridge] chain balance refresh error", err);
+          setError(err instanceof Error ? err : new Error("Balance refresh error"));
+        });
+      });
+
+      provider.on("disconnect", () => {
+        clearWalletState();
+      });
+    },
+    [clearWalletState, loadBalances],
+  );
 
   const connect = useCallback(
     async (targetConnector) => {
@@ -77,93 +260,139 @@ export default function useWalletBridge({ symbols = [] } = {}) {
       setStatus("connecting");
       setError(null);
       try {
-        let payload;
-        if (endpoint) {
-          const response = await fetch(endpoint, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ connector: targetConnector }),
-          });
-          if (!response.ok) {
-            throw new Error(`Wallet bridge ${response.status}`);
-          }
-          payload = await response.json();
-        } else {
-          payload = await new Promise((resolve) => {
-            setTimeout(() => resolve(mockPayload()), 600);
-          });
+        const provider =
+          targetConnector === "injected"
+            ? window.ethereum
+            : await createWalletConnectProvider();
+
+        if (!provider) {
+          throw new Error("Aucun wallet EVM detecte dans ce navigateur.");
         }
+
+        const accounts = await requestAccounts(provider, targetConnector);
+        const nextAccount = accounts?.[0];
+        if (!nextAccount) {
+          throw new Error("Aucun compte wallet retourne.");
+        }
+
+        providerRef.current = provider;
+        attachProviderEvents(provider);
+
+        const rawChainId =
+          (await provider.request?.({ method: "eth_chainId" })) || DEFAULT_CHAIN_ID;
+        const nextChainId = toDecimalChainId(rawChainId);
+
         setConnectorId(targetConnector);
-        setAccount(payload.account || DEFAULT_ACCOUNT);
-        setNetwork(payload.network || DEFAULT_NETWORK);
-        setBalances(normalizeBalances(payload.balances || {}));
+        setAccount(nextAccount);
+        setChainId(nextChainId);
+        setNetwork(CHAIN_NAMES[nextChainId] || `Chain ${nextChainId}`);
+        await loadBalances(provider, nextAccount).catch((err) => {
+          console.error("[useWalletBridge] initial balance error", err);
+          setError(err instanceof Error ? err : new Error("Balance refresh error"));
+        });
         setStatus("connected");
       } catch (err) {
         console.error("[useWalletBridge] connect error", err);
-        setError(err instanceof Error ? err : new Error("Wallet bridge error"));
+        setError(err instanceof Error ? err : new Error("Wallet connection error"));
         setStatus("error");
       }
     },
-    [endpoint, mockPayload, normalizeBalances]
+    [attachProviderEvents, loadBalances],
   );
 
-  const disconnect = useCallback(() => {
-    setAccount(null);
-    setConnectorId(null);
-    setBalances({});
-    setStatus("disconnected");
-    setError(null);
-  }, []);
+  const sendSwapQuote = useCallback(
+    async (quote) => {
+      const provider = providerRef.current;
+      if (!provider || !account) {
+        throw new Error("Wallet non connecte.");
+      }
 
-  const refresh = useCallback(() => {
-    setRefreshTick((tick) => tick + 1);
-  }, []);
+      const tx = quote?.transaction || quote;
+      if (!tx?.to || !tx?.data) {
+        throw new Error("Quote 0x incomplete: transaction manquante.");
+      }
+
+      const sellTokenAddress = (
+        quote?.sellTokenAddress ||
+        quote?.sellToken?.address ||
+        quote?.metadata?.sellToken ||
+        ""
+      ).toLowerCase();
+      const allowanceTarget = (
+        quote?.allowanceTarget ||
+        quote?.issues?.allowance?.spender ||
+        ""
+      ).toLowerCase();
+      const sellAmount = quote?.sellAmount || quote?.metadata?.sellAmount;
+
+      if (
+        sellTokenAddress &&
+        allowanceTarget &&
+        sellAmount &&
+        !NATIVE_TOKEN_ADDRESSES.has(sellTokenAddress)
+      ) {
+        const web3Provider = new ethers.providers.Web3Provider(provider, "any");
+        const token = new ethers.Contract(sellTokenAddress, ERC20_ABI, web3Provider);
+        const currentAllowance = await token.allowance(account, allowanceTarget);
+        const requiredAllowance = ethers.BigNumber.from(sellAmount);
+        if (currentAllowance.lt(requiredAllowance)) {
+          const approvalData = token.interface.encodeFunctionData("approve", [
+            allowanceTarget,
+            requiredAllowance,
+          ]);
+          await provider.request({
+            method: "eth_sendTransaction",
+            params: [
+              {
+                from: account,
+                to: sellTokenAddress,
+                data: approvalData,
+                value: "0x0",
+              },
+            ],
+          });
+        }
+      }
+
+      const swapTx = {
+        from: account,
+        to: tx.to,
+        data: tx.data,
+        value: tx.value ? ethers.BigNumber.from(tx.value).toHexString() : "0x0",
+      };
+
+      if (tx.gas) swapTx.gas = ethers.BigNumber.from(tx.gas).toHexString();
+      if (tx.gasPrice) swapTx.gasPrice = ethers.BigNumber.from(tx.gasPrice).toHexString();
+
+      return provider.request({
+        method: "eth_sendTransaction",
+        params: [swapTx],
+      });
+    },
+    [account],
+  );
 
   useEffect(() => {
-    if (status !== "connected" || !connectorId) return undefined;
-    let cancelled = false;
-    const reload = async () => {
-      try {
-        let payload;
-        if (endpoint) {
-          const response = await fetch(`${endpoint}?connector=${connectorId}`, {
-            headers: { Accept: "application/json" },
-          });
-          if (!response.ok) {
-            throw new Error(`Wallet bridge ${response.status}`);
-          }
-          payload = await response.json();
-        } else {
-          payload = mockPayload();
-        }
-        if (cancelled) return;
-        setBalances(normalizeBalances(payload.balances || {}));
-        setNetwork(payload.network || DEFAULT_NETWORK);
-        setAccount(payload.account || account);
-        setError(null);
-        setStatus("connected");
-      } catch (err) {
-        if (cancelled) return;
-        setError(err instanceof Error ? err : new Error("Wallet bridge error"));
-        setStatus("error");
-      }
-    };
-    reload();
-    return () => {
-      cancelled = true;
-    };
-  }, [status, connectorId, endpoint, mockPayload, normalizeBalances, account, refreshTick]);
+    if (status !== "connected" || !providerRef.current || !account) return;
+    loadBalances(providerRef.current, account).catch((err) => {
+      console.error("[useWalletBridge] refresh error", err);
+      setError(err instanceof Error ? err : new Error("Balance refresh error"));
+      setStatus("error");
+    });
+  }, [account, loadBalances, refreshTick, status]);
 
   return {
-    connectors: WALLET_CONNECTORS,
+    connectors,
     connectorId,
     status,
     account,
     network,
+    chainId,
     balances,
     error,
     connect,
     disconnect,
     refresh,
+    sendSwapQuote,
   };
 }

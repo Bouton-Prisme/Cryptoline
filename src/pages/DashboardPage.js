@@ -19,12 +19,6 @@ import WatchlistPanel from "../components/WatchlistPanel";
 import { useAppPreferences } from "../context/AppPreferencesContext";
 import { formatMoney, formatPct, formatCompact } from "../utils/formatters";
 
-const THEMES = {
-  ocean: "Ocean Pulse",
-  sand: "Sand Storm",
-  mint: "Mint Grid",
-};
-
 const NEWS_TAGS = [
   { key: "all", label: "Tous" },
   { key: "macro", label: "Macro" },
@@ -33,12 +27,33 @@ const NEWS_TAGS = [
 ];
 
 const ZEROX_QUOTE_ENDPOINT =
-  process.env.REACT_APP_ZEROX_QUOTE || "https://api.0x.org/swap/v1/quote";
-const DCA_BASE_STABLE = process.env.REACT_APP_DCA_STABLE || "USDC";
-const EXECUTIONS_ENDPOINT =
+  process.env.REACT_APP_ZEROX_QUOTE || "/api/dca-quote";
+const DEFAULT_DCA_BASE_STABLE = process.env.REACT_APP_DCA_STABLE || "USDC";
+const DEFAULT_EXECUTIONS_ENDPOINT =
   process.env.REACT_APP_EXECUTIONS_ENDPOINT || "/api/execute-dca";
-const DCA_SCHEDULE_ENDPOINT =
+const DEFAULT_DCA_SCHEDULE_ENDPOINT =
   process.env.REACT_APP_DCA_SCHEDULE_ENDPOINT || "/api/dca-plans";
+
+const CHART_RANGES = {
+  "24h": { days: 1, label: "24h" },
+  "7j": { days: 7, label: "7 jours" },
+  "30j": { days: 30, label: "30 jours" },
+  "1an": { days: 365, label: "1 an" },
+};
+
+const DEFAULT_MACRO_SIGNALS = {
+  fearGreedScore: null,
+  fearGreedLabel: "Collecte en cours",
+  fundingRate: null,
+  fundingLabel: "Collecte en cours",
+  dominanceSpread: null,
+  dominanceLabel: "Dominance en calcul",
+  openInterest: null,
+  btcDominance: null,
+  ethDominance: null,
+  totalMarketCapUsd: null,
+  totalVolumeUsd: null,
+};
 
 const CONDITION_DEFINITIONS = [
   {
@@ -94,16 +109,43 @@ function ChartTooltip({ active, payload, label }) {
   );
 }
 
+function normalizeMarketChart(prices, range) {
+  if (!Array.isArray(prices)) return [];
+
+  const dateFormatter =
+    range === "24h"
+      ? new Intl.DateTimeFormat("fr-FR", {
+          hour: "2-digit",
+          minute: "2-digit",
+        })
+      : range === "7j"
+        ? new Intl.DateTimeFormat("fr-FR", {
+            weekday: "short",
+            day: "2-digit",
+          })
+        : new Intl.DateTimeFormat("fr-FR", {
+            day: "2-digit",
+            month: "short",
+          });
+
+  return prices
+    .map(([ts, value]) => ({
+      ts,
+      label: dateFormatter.format(ts),
+      value: Number(value),
+    }))
+    .filter((point) => Number.isFinite(point.ts) && Number.isFinite(point.value));
+}
+
 export default function DashboardPage() {
   const {
-    theme,
-    setTheme,
     selected,
     setSelected,
     holdings,
     setHoldings,
     watchlist,
     setWatchlist,
+    accountSettings,
   } = useAppPreferences();
   const [dcaAmount, setDcaAmount] = useState(200);
   const [dcaMonths, setDcaMonths] = useState(12);
@@ -123,14 +165,30 @@ export default function DashboardPage() {
   const [dcaExecutionMessage, setDcaExecutionMessage] = useState(null);
   const [dcaScheduleMessage, setDcaScheduleMessage] = useState(null);
   const [newsFilter, setNewsFilter] = useState("all");
+  const [researchFeed, setResearchFeed] = useState([]);
+  const [researchStatus, setResearchStatus] = useState("idle");
+  const [researchError, setResearchError] = useState(null);
+  const [researchMeta, setResearchMeta] = useState(null);
+  const [macroSignals, setMacroSignals] = useState(DEFAULT_MACRO_SIGNALS);
+  const [macroStatus, setMacroStatus] = useState("idle");
+  const [macroError, setMacroError] = useState(null);
+  const [macroMeta, setMacroMeta] = useState(null);
+  const [chartRange, setChartRange] = useState("24h");
+  const [rangeChartData, setRangeChartData] = useState([]);
+  const [rangeChartStatus, setRangeChartStatus] = useState("idle");
+  const [rangeChartError, setRangeChartError] = useState(null);
   const {
     alerts,
+    events: alertEvents,
     status: alertsStatus,
     error: alertsError,
     createAlert,
     deleteAlert,
     refresh: refreshAlerts,
-  } = useAlerts();
+    runCheck: runAlertCheck,
+  } = useAlerts({
+    endpoint: accountSettings.alertsEndpoint || undefined,
+  });
   const [alertSymbol, setAlertSymbol] = useState("BTC");
   const [alertName, setAlertName] = useState("");
   const [alertNote, setAlertNote] = useState("");
@@ -148,6 +206,94 @@ export default function DashboardPage() {
       setSelected(Object.keys(MARKET_UNIVERSE)[0]);
     }
   }, [selected, setSelected]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+
+    const loadResearchFeed = async () => {
+      setResearchStatus((current) => (current === "ready" ? "refreshing" : "loading"));
+      setResearchError(null);
+      try {
+        const params = new URLSearchParams({
+          tag: newsFilter,
+          limit: "12",
+        });
+        const response = await fetch(`/api/research-feed?${params.toString()}`, {
+          headers: { Accept: "application/json" },
+          signal: controller.signal,
+        });
+        if (!response.ok) {
+          throw new Error(`Research API ${response.status}`);
+        }
+        const payload = await response.json();
+        setResearchFeed(Array.isArray(payload?.items) ? payload.items : []);
+        setResearchMeta({
+          cached: Boolean(payload?.cached),
+          fetchedAt: payload?.fetchedAt || null,
+          errors: Array.isArray(payload?.errors) ? payload.errors : [],
+        });
+        setResearchStatus("ready");
+      } catch (err) {
+        if (err?.name === "AbortError") return;
+        console.error("[research] feed error", err);
+        setResearchFeed([]);
+        setResearchMeta(null);
+        setResearchError(err instanceof Error ? err : new Error("Research feed error"));
+        setResearchStatus("error");
+      }
+    };
+
+    loadResearchFeed();
+
+    return () => controller.abort();
+  }, [newsFilter]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const controller = new AbortController();
+
+    const loadMacroSignals = async () => {
+      setMacroStatus((current) => (current === "ready" ? "refreshing" : "loading"));
+      setMacroError(null);
+      try {
+        const response = await fetch("/api/macro-signals", {
+          headers: { Accept: "application/json" },
+          signal: controller.signal,
+        });
+        if (!response.ok) {
+          throw new Error(`Macro API ${response.status}`);
+        }
+        const payload = await response.json();
+        if (cancelled) return;
+        setMacroSignals({
+          ...DEFAULT_MACRO_SIGNALS,
+          ...payload,
+        });
+        setMacroMeta({
+          cached: Boolean(payload?.cached),
+          fetchedAt: payload?.fetchedAt || null,
+          errors: Array.isArray(payload?.errors) ? payload.errors : [],
+        });
+        setMacroStatus("ready");
+      } catch (err) {
+        if (err?.name === "AbortError") return;
+        console.error("[macro] signals error", err);
+        setMacroSignals(DEFAULT_MACRO_SIGNALS);
+        setMacroMeta(null);
+        setMacroError(err instanceof Error ? err : new Error("Macro signals error"));
+        setMacroStatus("error");
+      }
+    };
+
+    loadMacroSignals();
+    const timer = setInterval(loadMacroSignals, 120_000);
+
+    return () => {
+      cancelled = true;
+      controller.abort();
+      clearInterval(timer);
+    };
+  }, []);
 
   const trackedUniverse = useMemo(() => {
     const base = new Set(Object.keys(MARKET_UNIVERSE));
@@ -169,12 +315,27 @@ export default function DashboardPage() {
     status: walletStatus,
     account: walletAccount,
     network: walletNetwork,
+    chainId: walletChainId,
     balances: walletBalances,
     error: walletError,
     connect: connectWallet,
     disconnect: disconnectWallet,
     refresh: refreshWallet,
+    sendSwapQuote,
   } = useWalletBridge({ symbols: trackedUniverse });
+  const custodyAccount =
+    walletAccount ||
+    accountSettings.defaultWalletAddress ||
+    accountSettings.custodyAccountId ||
+    "";
+  const custodyEndpoint = accountSettings.custodyEndpoint || undefined;
+  const dcaBaseStable =
+    accountSettings.dcaStable || DEFAULT_DCA_BASE_STABLE;
+  const executionsEndpoint =
+    accountSettings.dcaExecutionEndpoint || DEFAULT_EXECUTIONS_ENDPOINT;
+  const dcaScheduleEndpoint =
+    accountSettings.dcaScheduleEndpoint || DEFAULT_DCA_SCHEDULE_ENDPOINT;
+
   const {
     positions: custodianPositions,
     holdingsMap: custodianHoldingsMap,
@@ -183,8 +344,9 @@ export default function DashboardPage() {
     lastUpdated: custodyLastUpdated,
     refresh: refreshCustody,
   } = useCustodianHoldings({
-    account: walletAccount,
+    account: custodyAccount,
     symbols: trackedUniverse,
+    endpoint: custodyEndpoint,
   });
 
   const {
@@ -222,6 +384,53 @@ export default function DashboardPage() {
       },
     };
   }, [coins, coinsMap, selected]);
+
+  useEffect(() => {
+    const coingeckoId = MARKET_UNIVERSE[coin?.symbol]?.coingeckoId;
+    const rangeConfig = CHART_RANGES[chartRange];
+    if (!coingeckoId || !rangeConfig) {
+      setRangeChartData([]);
+      return undefined;
+    }
+
+    const controller = new AbortController();
+
+    const loadRangeChart = async () => {
+      setRangeChartStatus("loading");
+      setRangeChartError(null);
+      try {
+        const params = new URLSearchParams({
+          vs_currency: "usd",
+          days: String(rangeConfig.days),
+        });
+        const response = await fetch(
+          `https://api.coingecko.com/api/v3/coins/${coingeckoId}/market_chart?${params.toString()}`,
+          {
+            headers: { Accept: "application/json" },
+            signal: controller.signal,
+          },
+        );
+
+        if (!response.ok) {
+          throw new Error(`CoinGecko ${response.status} - ${response.statusText}`);
+        }
+
+        const payload = await response.json();
+        setRangeChartData(normalizeMarketChart(payload.prices, chartRange));
+        setRangeChartStatus("ready");
+      } catch (err) {
+        if (err?.name === "AbortError") return;
+        console.error("[DashboardPage] chart range fetch error", err);
+        setRangeChartData([]);
+        setRangeChartError(err instanceof Error ? err : new Error("Chart range fetch failed"));
+        setRangeChartStatus("error");
+      }
+    };
+
+    loadRangeChart();
+
+    return () => controller.abort();
+  }, [coin?.symbol, chartRange]);
 
   useEffect(() => {
     if (!coins.length) return;
@@ -276,16 +485,22 @@ export default function DashboardPage() {
   }, [coins, trackedUniverse]);
 
   const chartData = useMemo(() => {
+    if (rangeChartData.length) return rangeChartData;
     if (!coin?.sparkline?.length) return [];
-    return coin.sparkline;
-  }, [coin]);
+    if (chartRange === "24h") return coin.sparkline.slice(-24);
+    if (chartRange === "7j") return coin.sparkline;
+    return [];
+  }, [chartRange, coin, rangeChartData]);
 
   const heroOrderBook = hasLiveCoin ? orderBooks[coin.symbol] : null;
+  const hasOrderBookData =
+    Boolean(heroOrderBook?.bids?.length) && Boolean(heroOrderBook?.asks?.length);
   const isMarketLoading =
     marketStatus === "loading" || marketStatus === "refreshing";
   const errorPreview = marketError?.message
     ? `${marketError.message.split(" ").slice(0, 4).join(" ")}...`
     : null;
+  const chartRangeLabel = CHART_RANGES[chartRange]?.label || chartRange;
 
   const streamIndicator = useMemo(() => {
     switch (streamStatus) {
@@ -331,72 +546,6 @@ export default function DashboardPage() {
     return "Marche prudente";
   }, [coins]);
 
-  const macroSignals = useMemo(() => {
-    if (!coins.length) {
-      return {
-        fearGreedScore: null,
-        fearGreedLabel: "Flux indisponible",
-        fundingRate: null,
-        fundingLabel: "Collecte en cours",
-        dominanceSpread: null,
-        dominanceLabel: "Dominance en calcul",
-        openInterest: null,
-        btcDominance: null,
-        ethDominance: null,
-      };
-    }
-
-    const btc = coinsMap.BTC;
-    const eth = coinsMap.ETH;
-    const avg24h =
-      coins.reduce((sum, item) => sum + (item.change24h || 0), 0) /
-      coins.length;
-    const avg7d =
-      coins.reduce((sum, item) => sum + (item.change7d || 0), 0) / coins.length;
-    const normalizedScore = Math.max(
-      15,
-      Math.min(85, Math.round(55 + avg24h * 1.5)),
-    );
-    const fundingRate = avg7d / 700;
-    const totalVolume = coins.reduce(
-      (sum, item) => sum + (item.volume24h || 0),
-      0,
-    );
-    const openInterest = totalVolume * 0.032;
-    const dominanceSpread = (btc?.dominance || 0) - (eth?.dominance || 0);
-
-    const fearGreedLabel =
-      normalizedScore >= 65
-        ? "Greed"
-        : normalizedScore <= 35
-          ? "Fear"
-          : "Neutral";
-
-    let fundingLabel = "Neutre";
-    if (fundingRate > 0.002) {
-      fundingLabel = "Long bias";
-    } else if (fundingRate < -0.002) {
-      fundingLabel = "Short bias";
-    }
-
-    const dominanceLabel =
-      dominanceSpread >= 0
-        ? `BTC +${dominanceSpread.toFixed(1)} pts`
-        : `ETH +${Math.abs(dominanceSpread).toFixed(1)} pts`;
-
-    return {
-      fearGreedScore: normalizedScore,
-      fearGreedLabel,
-      fundingRate,
-      fundingLabel,
-      dominanceSpread,
-      dominanceLabel,
-      openInterest,
-      btcDominance: btc?.dominance ?? null,
-      ethDominance: eth?.dominance ?? null,
-    };
-  }, [coins, coinsMap]);
-
   const sectorHeatmap = useMemo(() => {
     if (!coins.length) return [];
     const buckets = coins.reduce((acc, item) => {
@@ -424,93 +573,9 @@ export default function DashboardPage() {
       ? sectorHeatmap[0].weight
       : 1;
 
-  const topMover24h = useMemo(() => {
-    if (!coins.length) return null;
-    return [...coins].sort(
-      (a, b) => (b.change24h || 0) - (a.change24h || 0),
-    )[0];
-  }, [coins]);
-
-  const researchFeed = useMemo(() => {
-    const safePct = (value) =>
-      Number.isFinite(value) ? formatPct(value) : "N/A";
-    const safeMoney = (value) =>
-      Number.isFinite(value)
-        ? formatCompact(value, { style: "currency", currency: "USD" })
-        : "N/A";
-    const now = Date.now();
-
-    const entries = [
-      {
-        id: "rss-macro",
-        source: "MacroScope RSS",
-        tag: "macro",
-        title: "Macro liquidity check",
-        summary: `Fear & Greed à ${
-          macroSignals.fearGreedScore ?? "N/A"
-        } (${macroSignals.fearGreedLabel}) et funding ${
-          macroSignals.fundingLabel
-        }.`,
-        minutesAgo: 18,
-      },
-      {
-        id: "twitter-defi",
-        source: "CryptoTwitter",
-        tag: "defi",
-        title: topMover24h
-          ? `${topMover24h.symbol} lead les flows DeFi`
-          : "DeFi rotation",
-        summary: topMover24h
-          ? `${topMover24h.symbol} affiche ${safePct(
-              topMover24h.change24h,
-            )} avec ${safeMoney(topMover24h.volume24h)} d'activité.`
-          : "Variation forte sur les tokens DeFi suivis.",
-        minutesAgo: 42,
-      },
-      {
-        id: "glassnode-oi",
-        source: "Glassnode",
-        tag: "macro",
-        title: "Open interest agrégé",
-        summary: `OI global ${
-          macroSignals.openInterest
-            ? formatCompact(macroSignals.openInterest, {
-                style: "currency",
-                currency: "USD",
-              })
-            : "non disponible"
-        }, spread dominance ${macroSignals.dominanceLabel}.`,
-        minutesAgo: 7,
-      },
-      {
-        id: "reg-watch",
-        source: "Regulation Wire",
-        tag: "regulation",
-        title: "Cadre régulatoire US",
-        summary:
-          "Rumeurs d'un cadre stablecoin revu par le Congrès; surveiller les impacts sur les flux USD.",
-        minutesAgo: 65,
-      },
-    ];
-
-    const relativeLabel = (minutes) => {
-      if (!Number.isFinite(minutes) || minutes <= 0) return "À l'instant";
-      if (minutes < 60) return `Il y a ${minutes} min`;
-      const hours = Math.floor(minutes / 60);
-      return hours === 1 ? "Il y a 1h" : `Il y a ${hours}h`;
-    };
-
-    return entries.map((entry, index) => ({
-      ...entry,
-      time: relativeLabel(entry.minutesAgo),
-      publishedAt: now - entry.minutesAgo * 60 * 1000 - index * 1000,
-    }));
-  }, [macroSignals, topMover24h]);
-
   const filteredResearch = useMemo(() => {
-    if (newsFilter === "all") return researchFeed;
-    return researchFeed.filter((item) => item.tag === newsFilter);
-  }, [newsFilter, researchFeed]);
+    return researchFeed;
+  }, [researchFeed]);
 
   const custodyPositionMap = useMemo(() => {
     return custodianPositions.reduce((acc, position) => {
@@ -615,11 +680,13 @@ export default function DashboardPage() {
       setDcaQuoteError(null);
       try {
         const params = new URLSearchParams({
-          sellToken: DCA_BASE_STABLE,
+          sellToken: dcaBaseStable,
           buyToken: meta.swapToken,
           sellAmount: Math.round(Number(dcaAmount) * 1_000_000).toString(),
           slippagePercentage: (Number(dcaSlippage) / 100).toString(),
         });
+        if (walletAccount) params.append("takerAddress", walletAccount);
+        if (walletChainId) params.append("chainId", String(walletChainId));
 
         const response = await fetch(
           `${ZEROX_QUOTE_ENDPOINT}?${params.toString()}`,
@@ -629,7 +696,11 @@ export default function DashboardPage() {
           },
         );
         if (!response.ok) {
-          throw new Error(`0x quote ${response.status}`);
+          const message =
+            response.status === 404
+              ? "Aucune route 0x disponible pour cet actif ou ce montant. Essaie un autre actif, augmente le montant ou desactive 0x."
+              : `Quote 0x indisponible (${response.status}). Reessaie plus tard ou verifie la paire selectionnee.`;
+          throw new Error(message);
         }
         const payload = await response.json();
         if (cancelled) return;
@@ -654,7 +725,7 @@ export default function DashboardPage() {
       cancelled = true;
       controller.abort();
     };
-  }, [dcaTargetSymbol, dcaAmount, dcaSlippage, dcaProvider]);
+  }, [dcaTargetSymbol, dcaAmount, dcaSlippage, dcaProvider, dcaBaseStable, walletAccount, walletChainId]);
 
   const custodyTargetPosition = custodyPositionMap[dcaTargetSymbol];
   const custodyAverageCost =
@@ -664,7 +735,7 @@ export default function DashboardPage() {
       ? custodyTargetPosition.costBasis / custodyTargetPosition.amount
       : null;
 
-  const availableStableBalance = walletBalances[DCA_BASE_STABLE] ?? 0;
+  const availableStableBalance = walletBalances[dcaBaseStable] ?? 0;
   const canExecuteDca = Boolean(walletAccount && dcaQuote && !isExecutingDca);
 
   const activeAlertConditions = useMemo(() => {
@@ -777,11 +848,22 @@ export default function DashboardPage() {
     }
   }
 
+  async function handleRunAlertCheck() {
+    try {
+      await runAlertCheck();
+    } catch (err) {
+      console.error("[alerts] worker check error", err);
+    }
+  }
+
   async function executeDcaNow() {
     if (!canExecuteDca || !dcaQuote) return;
     setDcaExecutionMessage(null);
     setIsExecutingDca(true);
     try {
+      if (!sendSwapQuote) {
+        throw new Error("Wallet incompatible avec l'execution de transaction.");
+      }
       const payload = {
         account: walletAccount,
         connector: walletConnectorId,
@@ -793,25 +875,41 @@ export default function DashboardPage() {
           buyToken: dcaQuote.buyTokenAddress,
           sellAmount: dcaQuote.sellAmount,
           buyAmount: dcaQuote.buyAmount,
+          chainId: walletChainId,
         },
       };
-      if (EXECUTIONS_ENDPOINT) {
-        const response = await fetch(EXECUTIONS_ENDPOINT, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload),
-        });
-        if (!response.ok) {
-          throw new Error(`Execution API ${response.status}`);
-        }
-        const result = await response.json();
-        setDcaExecutionMessage(
-          result?.message || "Ordre transmis au relais 0x.",
-        );
-      } else {
-        await new Promise((resolve) => setTimeout(resolve, 900));
-        setDcaExecutionMessage("Simulation: ordre 0x prepare localement.");
+
+      const response = await fetch(executionsEndpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      if (!response.ok) {
+        throw new Error(`Execution API ${response.status}`);
       }
+      const prepared = await response.json();
+      setDcaExecutionMessage("Ordre prepare. Signature wallet requise...");
+
+      const txHash = await sendSwapQuote({
+        ...dcaQuote,
+        metadata: payload.metadata,
+      });
+
+      if (prepared?.id) {
+        await fetch(`/api/dca-executions/${prepared.id}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            status: "submitted",
+            tx_hash: txHash,
+          }),
+        }).catch((err) => {
+          console.warn("[dca] execution status update failed", err);
+        });
+      }
+
+      setDcaExecutionMessage(`Transaction envoyee: ${txHash}`);
+      refreshWallet();
     } catch (err) {
       console.error("[dca] execute error", err);
       setDcaExecutionMessage(
@@ -837,23 +935,18 @@ export default function DashboardPage() {
         startDate: dcaStartDate,
         slippage: dcaSlippage,
       };
-      if (DCA_SCHEDULE_ENDPOINT) {
-        const response = await fetch(DCA_SCHEDULE_ENDPOINT, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload),
-        });
-        if (!response.ok) {
-          throw new Error(`Plan API ${response.status}`);
-        }
-        const result = await response.json();
-        setDcaScheduleMessage(
-          result?.message || "Plan DCA programme via le backend.",
-        );
-      } else {
-        await new Promise((resolve) => setTimeout(resolve, 700));
-        setDcaScheduleMessage("Simulation: plan DCA enregistre localement.");
+      const response = await fetch(dcaScheduleEndpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      if (!response.ok) {
+        throw new Error(`Plan API ${response.status}`);
       }
+      const result = await response.json();
+      setDcaScheduleMessage(
+        result?.message || "Plan DCA programme via le backend.",
+      );
     } catch (err) {
       console.error("[dca] schedule error", err);
       setDcaScheduleMessage(
@@ -913,26 +1006,12 @@ export default function DashboardPage() {
     <>
       <header className="topbar reveal">
         <div className="brand">
-          <img src="/cryptolinelogo.png" alt="CryptoLine" />
           <div>
-            <p className="eyebrow">Dashboard V2</p>
-            <h1>CryptoLine Studio</h1>
+            <h1>Studio</h1>
           </div>
         </div>
 
         <div className="controls">
-          <select
-            value={theme}
-            onChange={(e) => setTheme(e.target.value)}
-            className="field"
-          >
-            {Object.entries(THEMES).map(([key, label]) => (
-              <option key={key} value={key}>
-                Theme: {label}
-              </option>
-            ))}
-          </select>
-
           <select
             value={selected}
             onChange={(e) => setSelected(e.target.value.toUpperCase())}
@@ -947,208 +1026,187 @@ export default function DashboardPage() {
         </div>
       </header>
 
-      <section className="asset-cluster reveal delay-1">
-        <div className="asset-grid">
-          <article className="card hero-main">
-            <p className="eyebrow">Actif focus</p>
-            <div className="coin-head">
-              <div>
-                <h2>
-                  {coin.name} <span>{coin.symbol}</span>
-                </h2>
-                <p>
-                  {coin.category} | Volatilite {coin.volatility}
-                </p>
-              </div>
-              <button
-                type="button"
-                className={`watch ${watchlist.includes(coin.symbol) ? "active" : ""}`}
-                onClick={() => toggleWatch(coin.symbol)}
-              >
-                {watchlist.includes(coin.symbol)
-                  ? "Dans watchlist"
-                  : "Ajouter watchlist"}
-              </button>
-            </div>
-
-            <div className="live-controls">
-              <div className="badges">
-                <span className={`badge ${streamIndicator.className}`}>
-                  {streamIndicator.label}
-                </span>
-                {isMarketLoading && (
-                  <span className="badge badge-muted">Maj REST...</span>
-                )}
-                {errorPreview && (
-                  <span
-                    className="badge badge-danger"
-                    title={marketError?.message}
-                  >
-                    API: {errorPreview}
-                  </span>
-                )}
-              </div>
-              <button
-                type="button"
-                className="ghost"
-                onClick={refreshMarket}
-                disabled={isMarketLoading}
-              >
-                Sync
-              </button>
-            </div>
-
-            <div className="kpis">
-              <div>
-                <label>Prix</label>
-                <strong>{formatMoney(coin.price)}</strong>
-              </div>
-              <div>
-                <label>24h</label>
-                <strong className={coin.change24h >= 0 ? "up" : "down"}>
+      <div className="dashboard-grid reveal delay-1">
+        <div className="dashboard-main">
+          <section className="asset-cluster">
+            <article className="card hero-main">
+              <div className="hero-line">
+                <div className="coin-title">
+                  <p className="eyebrow">Actif focus</p>
+                  <h2>
+                    {coin.name} <span>{coin.symbol}</span>
+                  </h2>
+                </div>
+                <strong className="hero-price">{formatMoney(coin.price)}</strong>
+                <strong
+                  className={`hero-change ${coin.change24h >= 0 ? "up" : "down"}`}
+                >
                   {formatPct(coin.change24h)}
                 </strong>
-              </div>
-              <div>
-                <label>7j</label>
-                <strong className={coin.change7d >= 0 ? "up" : "down"}>
-                  {formatPct(coin.change7d)}
-                </strong>
-              </div>
-              <div>
-                <label>Volume 24h</label>
-                <strong>
-                  {formatCompact(coin.volume24h, {
-                    style: "currency",
-                    currency: "USD",
-                  })}
-                </strong>
-              </div>
-              <div>
-                <label>Dominance</label>
-                <strong>{formatPct(coin.dominance)}</strong>
-              </div>
-            </div>
-
-            <div className="chart-wrap">
-              <ResponsiveContainer width="100%" height="100%">
-                <LineChart
-                  data={chartData}
-                  margin={{ top: 12, right: 10, left: 0, bottom: 0 }}
+                <button
+                  type="button"
+                  className={`watch ${watchlist.includes(coin.symbol) ? "active" : ""}`}
+                  onClick={() => toggleWatch(coin.symbol)}
                 >
-                  <CartesianGrid
-                    strokeDasharray="3 5"
-                    stroke="rgba(255, 255, 255, 0.12)"
-                  />
-                  <XAxis
-                    dataKey="label"
-                    tick={{ fontSize: 12, fill: "rgba(255,255,255,0.7)" }}
-                  />
-                  <YAxis
-                    tick={{ fontSize: 12, fill: "rgba(255,255,255,0.7)" }}
-                    domain={["auto", "auto"]}
-                  />
-                  <Tooltip content={<ChartTooltip />} />
-                  <Line
-                    type="monotone"
-                    dataKey="value"
-                    stroke="var(--line-color)"
-                    strokeWidth={3}
-                    dot={false}
-                    activeDot={{ r: 5 }}
-                  />
-                </LineChart>
-              </ResponsiveContainer>
-            </div>
+                  {watchlist.includes(coin.symbol)
+                    ? "Dans watchlist"
+                    : "Ajouter watchlist"}
+                </button>
+              </div>
 
-            <div className="orderbook">
-              <div>
-                <p className="eyebrow">Carnet achat (Top 5)</p>
-                <div className="orderbook-rows">
-                  {heroOrderBook?.bids?.length ? (
-                    heroOrderBook.bids.map((level, index) => (
-                      <div key={`bid-${index}`} className="orderbook-row bid">
-                        <span>{formatMoney(level.price)}</span>
-                        <span>{level.size.toFixed(3)}</span>
-                      </div>
-                    ))
-                  ) : (
-                    <p className="empty">Flux intraday en attente...</p>
+              <div className="live-controls">
+                <div className="badges">
+                  <span className={`badge ${streamIndicator.className}`}>
+                    {streamIndicator.label}
+                  </span>
+                  {isMarketLoading && (
+                    <span className="badge badge-muted">Mise a jour...</span>
+                  )}
+                  {errorPreview && (
+                    <span
+                      className="badge badge-danger"
+                      title={marketError?.message}
+                    >
+                      API: {errorPreview}
+                    </span>
                   )}
                 </div>
+                <button
+                  type="button"
+                  className="ghost"
+                  onClick={refreshMarket}
+                  disabled={isMarketLoading}
+                >
+                  Sync
+                </button>
               </div>
-              <div>
-                <p className="eyebrow">Carnet vente (Top 5)</p>
-                <div className="orderbook-rows">
-                  {heroOrderBook?.asks?.length ? (
-                    heroOrderBook.asks.map((level, index) => (
-                      <div key={`ask-${index}`} className="orderbook-row ask">
-                        <span>{formatMoney(level.price)}</span>
-                        <span>{level.size.toFixed(3)}</span>
-                      </div>
-                    ))
-                  ) : (
-                    <p className="empty">Flux intraday en attente...</p>
-                  )}
+
+              <div className="metric-grid">
+                <div>
+                  <label>7 jours</label>
+                  <strong className={coin.change7d >= 0 ? "up" : "down"}>
+                    {formatPct(coin.change7d)}
+                  </strong>
+                </div>
+                <div>
+                  <label>Volume 24h</label>
+                  <strong>
+                    {formatCompact(coin.volume24h, {
+                      style: "currency",
+                      currency: "USD",
+                    })}
+                  </strong>
+                </div>
+                <div>
+                  <label>Dominance</label>
+                  <strong>{formatPct(coin.dominance)}</strong>
+                </div>
+                <div>
+                  <label>Profil</label>
+                  <strong>{coin.volatility}</strong>
                 </div>
               </div>
-            </div>
-          </article>
 
-          <div className="asset-side">
-            <WatchlistPanel
-              watchlist={watchlist}
-              coins={coins}
-              onSelect={setSelected}
-            />
-            <AlertsPanel
-              alerts={alerts}
-              alertsError={alertsError}
-              isAlertsSyncing={isAlertsSyncing}
-              refreshAlerts={refreshAlerts}
-              alertName={alertName}
-              setAlertName={setAlertName}
-              alertSymbol={alertSymbol}
-              setAlertSymbol={setAlertSymbol}
-              selectionUniverse={selectionUniverse}
-              alertNote={alertNote}
-              setAlertNote={setAlertNote}
-              alertChannel={alertChannel}
-              setAlertChannel={setAlertChannel}
-              conditionDefinitions={CONDITION_DEFINITIONS}
-              conditionState={conditionState}
-              toggleCondition={toggleCondition}
-              updateConditionValue={updateConditionValue}
-              canSubmitAlert={canSubmitAlert}
-              isSubmittingAlert={isSubmittingAlert}
-              handleCreateAlert={handleCreateAlert}
-              handleDeleteAlert={handleDeleteAlert}
-              formatConditionPreview={formatConditionPreview}
-            />
-          </div>
-        </div>
-      </section>
+              <div className="chart-head">
+                <div>
+                  <h3>Évolution du prix</h3>
+                  <p>{coin.category} / survoler le graphique pour le detail</p>
+                </div>
+                <div className="badges">
+                  <span className="badge badge-muted">{chartRangeLabel}</span>
+                  {rangeChartStatus === "loading" && (
+                    <span className="badge badge-muted">Chargement...</span>
+                  )}
+                  {rangeChartError && (
+                    <span
+                      className="badge badge-danger"
+                      title={rangeChartError.message}
+                    >
+                      Graphique indisponible
+                    </span>
+                  )}
+                </div>
+                <div className="period-tabs" aria-label="Periode du graphique">
+                  {["24h", "7j", "30j", "1an"].map((range) => (
+                    <button
+                      key={range}
+                      type="button"
+                      className={chartRange === range ? "active" : ""}
+                      onClick={() => setChartRange(range)}
+                    >
+                      {range}
+                    </button>
+                  ))}
+                </div>
+              </div>
 
-      <section className="execution-cluster reveal delay-2">
-        <div className="execution-grid">
-          <div className="execution-side">
-            <PortfolioCard
-              totalValue={totalValue}
-              sentiment={sentiment}
-              allocation={allocation}
-              holdings={holdings}
-            />
-          </div>
-          <div className="execution-main">
+              <div className="chart-wrap">
+                <ResponsiveContainer width="100%" height="100%">
+                  <LineChart
+                    data={chartData}
+                    margin={{ top: 12, right: 10, left: 0, bottom: 0 }}
+                  >
+                    <CartesianGrid
+                      strokeDasharray="3 5"
+                      stroke="rgba(255, 255, 255, 0.10)"
+                    />
+                    <XAxis
+                      dataKey="label"
+                      tick={{ fontSize: 12, fill: "rgba(238,245,241,0.72)" }}
+                    />
+                    <YAxis
+                      tick={{ fontSize: 12, fill: "rgba(238,245,241,0.72)" }}
+                      domain={["auto", "auto"]}
+                    />
+                    <Tooltip content={<ChartTooltip />} />
+                    <Line
+                      type="monotone"
+                      dataKey="value"
+                      stroke="var(--line-color)"
+                      strokeWidth={3}
+                      dot={false}
+                      activeDot={{ r: 5 }}
+                    />
+                  </LineChart>
+                </ResponsiveContainer>
+              </div>
+
+              {hasOrderBookData && (
+                <div className="orderbook">
+                  <div>
+                    <p className="eyebrow">Carnet achat</p>
+                    <div className="orderbook-rows">
+                      {heroOrderBook.bids.map((level, index) => (
+                        <div key={`bid-${index}`} className="orderbook-row bid">
+                          <span>{formatMoney(level.price)}</span>
+                          <span>{level.size.toFixed(3)}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                  <div>
+                    <p className="eyebrow">Carnet vente</p>
+                    <div className="orderbook-rows">
+                      {heroOrderBook.asks.map((level, index) => (
+                        <div key={`ask-${index}`} className="orderbook-row ask">
+                          <span>{formatMoney(level.price)}</span>
+                          <span>{level.size.toFixed(3)}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              )}
+            </article>
+
+          </section>
+
+          <section className="execution-cluster reveal delay-2">
             <article className="card execution-panel">
               <div className="execution-head">
                 <div>
-                  <p className="eyebrow">Gestion execution</p>
-                  <h3>Wallet + Custodian</h3>
-                  <p className="helper-text">
-                    Connecte ton wallet (WalletConnect / Ledger Live) et importe
-                    les soldes custodian pour pre-remplir les ordres.
-                  </p>
+                  <p className="eyebrow">Wallet / Custodian</p>
+                  <h3>Connexion et synchronisation</h3>
                 </div>
                 <div className="wallet-badges">
                   <span
@@ -1176,65 +1234,37 @@ export default function DashboardPage() {
                 </div>
               </div>
 
-              <div className="connector-grid">
-                {walletConnectors.map((connector) => (
-                  <button
-                    key={connector.id}
-                    type="button"
-                    className={`connector-card ${
-                      walletConnectorId === connector.id ? "active" : ""
-                    }`}
-                    onClick={() => connectWallet(connector.id)}
-                    disabled={
-                      walletStatus === "connecting" &&
-                      walletConnectorId === connector.id
-                    }
-                  >
-                    <strong>{connector.label}</strong>
-                    <p>{connector.description}</p>
-                  </button>
-                ))}
-                {walletStatus === "connected" && (
-                  <button
-                    type="button"
-                    className="connector-card ghost"
-                    onClick={disconnectWallet}
-                  >
-                    Deconnecter
-                  </button>
-                )}
-              </div>
-
-              <div className="wallet-status-row">
+              <div className="wallet-primary-row">
                 <div>
                   <small>Compte actif</small>
                   <strong>{walletAccount || "Non connecte"}</strong>
+                  <p>{walletNetwork || "Reseau non detecte"}</p>
                 </div>
-                <div>
-                  <small>Network</small>
-                  <strong>{walletNetwork || "N/A"}</strong>
-                </div>
-                <div className="wallet-actions">
+                {walletStatus === "connected" ? (
                   <button
                     type="button"
-                    className="ghost"
-                    onClick={refreshWallet}
-                    disabled={walletStatus !== "connected"}
-                  >
-                    Refresh wallet
-                  </button>
-                  <button
-                    type="button"
-                    className="ghost"
-                    onClick={() => refreshCustody()}
+                    className="primary-action"
+                    onClick={() => {
+                      refreshWallet();
+                      refreshCustody();
+                    }}
                     disabled={
                       custodyStatus === "loading" ||
                       custodyStatus === "refreshing"
                     }
                   >
-                    Sync custodian
+                    Synchroniser
                   </button>
-                </div>
+                ) : (
+                  <button
+                    type="button"
+                    className="primary-action"
+                    onClick={() => connectWallet(walletConnectors[0]?.id)}
+                    disabled={!walletConnectors[0] || walletStatus === "connecting"}
+                  >
+                    Connecter un wallet
+                  </button>
+                )}
               </div>
               {walletError && (
                 <p className="error-text">Wallet: {walletError.message}</p>
@@ -1253,6 +1283,38 @@ export default function DashboardPage() {
                   })}
                 </p>
               )}
+
+              <details className="technical-details">
+                <summary>Connecteurs disponibles</summary>
+                <div className="connector-grid compact">
+                  {walletConnectors.map((connector) => (
+                    <button
+                      key={connector.id}
+                      type="button"
+                      className={`connector-card ${
+                        walletConnectorId === connector.id ? "active" : ""
+                      }`}
+                      onClick={() => connectWallet(connector.id)}
+                      disabled={
+                        walletStatus === "connecting" &&
+                        walletConnectorId === connector.id
+                      }
+                    >
+                      <strong>{connector.label}</strong>
+                      <p>{connector.description}</p>
+                    </button>
+                  ))}
+                  {walletStatus === "connected" && (
+                    <button
+                      type="button"
+                      className="connector-card ghost"
+                      onClick={disconnectWallet}
+                    >
+                      Deconnecter
+                    </button>
+                  )}
+                </div>
+              </details>
 
               <div className="wallet-holdings-grid">
                 <div className="wallet-row wallet-row-head">
@@ -1277,22 +1339,23 @@ export default function DashboardPage() {
                     </span>
                     <span>{formatMoney(item.totalValue || 0)}</span>
                     <div className="row-actions">
-                      <button
-                        type="button"
-                        className="ghost"
-                        onClick={() => handleSyncHoldingFromWallet(item.symbol)}
+                      <select
+                        className="action-menu"
+                        defaultValue=""
+                        onChange={(event) => {
+                          if (event.target.value === "wallet") {
+                            handleSyncHoldingFromWallet(item.symbol);
+                          }
+                          if (event.target.value === "custody") {
+                            handleSyncHoldingFromCustody(item.symbol);
+                          }
+                          event.target.value = "";
+                        }}
                       >
-                        Wallet
-                      </button>
-                      <button
-                        type="button"
-                        className="ghost"
-                        onClick={() =>
-                          handleSyncHoldingFromCustody(item.symbol)
-                        }
-                      >
-                        Custodian
-                      </button>
+                        <option value="">Action</option>
+                        <option value="wallet">Depuis wallet</option>
+                        <option value="custody">Depuis custodian</option>
+                      </select>
                     </div>
                   </div>
                 ))}
@@ -1301,18 +1364,14 @@ export default function DashboardPage() {
               <div className="wallet-sync-actions">
                 <button
                   type="button"
-                  onClick={() => handleBulkSync("custody")}
-                  disabled={!custodianHoldingsMap}
-                >
-                  Importer tout (custodian)
-                </button>
-                <button
-                  type="button"
                   className="ghost"
-                  onClick={() => handleBulkSync("wallet")}
-                  disabled={!walletBalances}
+                  onClick={() => {
+                    handleBulkSync("custody");
+                    handleBulkSync("wallet");
+                  }}
+                  disabled={!custodianHoldingsMap && !walletBalances}
                 >
-                  Importer tout (wallet)
+                  Importer tous les soldes disponibles
                 </button>
               </div>
             </article>
@@ -1320,119 +1379,130 @@ export default function DashboardPage() {
             <article className="card dca-panel">
               <div className="dca-head">
                 <div>
-                  <p className="eyebrow">Module DCA</p>
-                  <h3>Execution programmee via 0x</h3>
-                  <p className="helper-text">
-                    Propose des ordres DCA pre-remplis en USDC et envoie les
-                    transactions au relais 0x ou a ton backend.
-                  </p>
+                  <p className="eyebrow">DCA</p>
+                  <h3>Plan d’investissement programme</h3>
                 </div>
                 <span className="badge badge-muted">
                   {dcaProvider.toUpperCase()}
                 </span>
               </div>
 
-              <div className="dca-fields advanced">
-                <label>
-                  <span>Actif cible</span>
-                  <select
-                    value={dcaTargetSymbol}
-                    onChange={(e) => {
-                      setDcaSymbolTouched(true);
-                      setDcaTargetSymbol(e.target.value);
-                    }}
-                  >
-                    {selectionUniverse.map((item) => (
-                      <option key={item.symbol} value={item.symbol}>
-                        {item.symbol} - {item.name || item.symbol}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <label>
-                  <span>Montant par run (USD)</span>
-                  <input
-                    type="number"
-                    min="10"
-                    step="10"
-                    value={dcaAmount}
-                    onChange={(e) => setDcaAmount(Number(e.target.value) || 0)}
-                  />
-                </label>
-                <label>
-                  <span>Duree (mois)</span>
-                  <input
-                    type="number"
-                    min="1"
-                    max="36"
-                    value={dcaMonths}
-                    onChange={(e) => setDcaMonths(Number(e.target.value) || 1)}
-                  />
-                </label>
-                <label>
-                  <span>Frequence</span>
-                  <select
-                    value={dcaFrequency}
-                    onChange={(e) => setDcaFrequency(e.target.value)}
-                  >
-                    <option value="quotidien">Quotidien</option>
-                    <option value="hebdo">Hebdomadaire</option>
-                    <option value="bimensuel">Bi-mensuel</option>
-                    <option value="mensuel">Mensuel</option>
-                  </select>
-                </label>
-                <label>
-                  <span>Slippage (%)</span>
-                  <input
-                    type="number"
-                    step="0.05"
-                    min="0.05"
-                    value={dcaSlippage}
-                    onChange={(e) =>
-                      setDcaSlippage(Number(e.target.value) || 0)
-                    }
-                  />
-                </label>
-                <label>
-                  <span>Date debut</span>
-                  <input
-                    type="date"
-                    value={dcaStartDate}
-                    onChange={(e) => setDcaStartDate(e.target.value)}
-                  />
-                </label>
+              <div className="dca-section">
+                <h4>Configuration</h4>
+                <div className="dca-fields advanced">
+                  <label>
+                    <span>Actif cible</span>
+                    <select
+                      value={dcaTargetSymbol}
+                      onChange={(e) => {
+                        setDcaSymbolTouched(true);
+                        setDcaTargetSymbol(e.target.value);
+                      }}
+                    >
+                      {selectionUniverse.map((item) => (
+                        <option key={item.symbol} value={item.symbol}>
+                          {item.symbol} - {item.name || item.symbol}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label>
+                    <span>Montant par run</span>
+                    <input
+                      type="number"
+                      min="10"
+                      step="10"
+                      value={dcaAmount}
+                      onChange={(e) => setDcaAmount(Number(e.target.value) || 0)}
+                    />
+                  </label>
+                  <label>
+                    <span>Frequence</span>
+                    <select
+                      value={dcaFrequency}
+                      onChange={(e) => setDcaFrequency(e.target.value)}
+                    >
+                      <option value="quotidien">Quotidien</option>
+                      <option value="hebdo">Hebdomadaire</option>
+                      <option value="bimensuel">Bi-mensuel</option>
+                      <option value="mensuel">Mensuel</option>
+                    </select>
+                  </label>
+                  <label>
+                    <span>Duree (mois)</span>
+                    <input
+                      type="number"
+                      min="1"
+                      max="36"
+                      value={dcaMonths}
+                      onChange={(e) => setDcaMonths(Number(e.target.value) || 1)}
+                    />
+                  </label>
+                  <label>
+                    <span>Date debut</span>
+                    <input
+                      type="date"
+                      value={dcaStartDate}
+                      onChange={(e) => setDcaStartDate(e.target.value)}
+                    />
+                  </label>
+                </div>
+
+                <details className="technical-details">
+                  <summary>Options avancees</summary>
+                  <label className="field-block">
+                    <span>Slippage (%)</span>
+                    <input
+                      type="number"
+                      step="0.05"
+                      min="0.05"
+                      value={dcaSlippage}
+                      onChange={(e) =>
+                        setDcaSlippage(Number(e.target.value) || 0)
+                      }
+                    />
+                  </label>
+                </details>
               </div>
 
-              <div className="dca-stats">
-                <div>
-                  <small>Stable dispo (wallet)</small>
-                  <strong>
-                    {availableStableBalance
-                      ? `${availableStableBalance.toLocaleString("fr-FR", {
-                          maximumFractionDigits: 2,
-                        })} ${DCA_BASE_STABLE}`
-                      : `0 ${DCA_BASE_STABLE}`}
-                  </strong>
-                </div>
-                <div>
-                  <small>Runs planifies</small>
-                  <strong>{dcaPlanPreview.occurrences}</strong>
-                </div>
-                <div>
-                  <small>Total investi</small>
-                  <strong>{formatMoney(dcaPlanPreview.totalInvested)}</strong>
-                </div>
-                <div>
-                  <small>Tokens projetes</small>
-                  <strong>{dcaPlanPreview.projectedTokens.toFixed(4)}</strong>
+              <div className="dca-summary">
+                <strong>
+                  {dcaAmount.toLocaleString("fr-FR", {
+                    maximumFractionDigits: 2,
+                  })}{" "}
+                  {dcaBaseStable} par {dcaFrequency} pendant {dcaMonths} mois
+                </strong>
+                <p>
+                  Montant total estime :{" "}
+                  <span>{formatMoney(dcaPlanPreview.totalInvested)}</span>
+                </p>
+                <div className="dca-stats">
+                  <div>
+                    <small>Stable dispo</small>
+                    <strong>
+                      {availableStableBalance
+                        ? `${availableStableBalance.toLocaleString("fr-FR", {
+                            maximumFractionDigits: 2,
+                          })} ${dcaBaseStable}`
+                        : `0 ${dcaBaseStable}`}
+                    </strong>
+                  </div>
+                  <div>
+                    <small>Runs planifies</small>
+                    <strong>{dcaPlanPreview.occurrences}</strong>
+                  </div>
+                  <div>
+                    <small>Tokens projetes</small>
+                    <strong>{dcaPlanPreview.projectedTokens.toFixed(4)}</strong>
+                  </div>
                 </div>
               </div>
 
-              <div className="dca-quote-panel">
+              <div className="dca-section execution">
+                <h4>Execution</h4>
                 <div>
-                  <p className="eyebrow">Quote 0x</p>
                   {isFetchingQuote && (
-                    <span className="badge badge-muted">Pricing...</span>
+                    <span className="badge badge-muted">Recherche du prix...</span>
                   )}
                   {dcaQuoteMetrics && (
                     <div className="quote-grid">
@@ -1462,197 +1532,263 @@ export default function DashboardPage() {
                   )}
                   {!dcaQuoteMetrics && !dcaQuoteError && (
                     <p className="helper-text">
-                      Obtiens un prix en renseignant ton montant et un actif
-                      supporte.
+                      Le prix 0x se met a jour avec l'actif, le montant et le wallet connecte.
                     </p>
                   )}
                   {dcaQuoteError && (
                     <p className="error-text">{dcaQuoteError.message}</p>
                   )}
                 </div>
-
-                <div className="dca-meta">
-                  <p>
-                    Cout moyen actuel:{" "}
-                    <strong>
-                      {custodyAverageCost
-                        ? formatMoney(custodyAverageCost)
-                        : "N/A"}{" "}
-                      → apres plan:{" "}
-                      {dcaTargetCoin?.price
-                        ? formatMoney(dcaTargetCoin.price)
-                        : "N/A"}
-                    </strong>
-                  </p>
-                  <p>
-                    Sources 0x:{" "}
-                    {dcaQuoteMetrics?.sources?.length
-                      ? dcaQuoteMetrics.sources
-                          .map(
-                            (source) =>
-                              `${source.name} (${Math.round(source.proportion * 100)}%)`,
-                          )
-                          .join(", ")
-                      : "En attente"}
-                  </p>
+                <div className="dca-actions">
+                  <div>
+                    <button
+                      type="button"
+                      className="primary-action"
+                      onClick={executeDcaNow}
+                      disabled={!canExecuteDca}
+                    >
+                      {isExecutingDca ? "Execution..." : "Executer maintenant"}
+                    </button>
+                    <small>Prepare l'ordre puis ouvre la signature dans le wallet.</small>
+                  </div>
+                  <div>
+                    <button
+                      type="button"
+                      className="ghost"
+                      onClick={scheduleDcaPlan}
+                      disabled={isSchedulingDca}
+                    >
+                      {isSchedulingDca ? "Planification..." : "Programmer le plan"}
+                    </button>
+                    <small>Enregistre le calendrier pour les prochains runs.</small>
+                  </div>
                 </div>
+                {dcaExecutionMessage && (
+                  <p className="info-text">{dcaExecutionMessage}</p>
+                )}
+                {dcaScheduleMessage && (
+                  <p className="info-text">{dcaScheduleMessage}</p>
+                )}
               </div>
-
-              <div className="dca-actions">
-                <button
-                  type="button"
-                  onClick={executeDcaNow}
-                  disabled={!canExecuteDca}
-                >
-                  {isExecutingDca ? "Execution..." : "Executer via 0x"}
-                </button>
-                <button
-                  type="button"
-                  className="ghost"
-                  onClick={scheduleDcaPlan}
-                  disabled={isSchedulingDca}
-                >
-                  {isSchedulingDca ? "Planification..." : "Programmer le plan"}
-                </button>
-              </div>
-              {dcaExecutionMessage && (
-                <p className="info-text">{dcaExecutionMessage}</p>
-              )}
-              {dcaScheduleMessage && (
-                <p className="info-text">{dcaScheduleMessage}</p>
-              )}
             </article>
-          </div>
-        </div>
-      </section>
+          </section>
 
-      <section className="intel-cluster reveal delay-3">
-        <article className="card stats-panel market-context">
-          <p className="eyebrow">Contexte marche</p>
-          <div className="macro-grid">
-            <div className="macro-item">
-              <span>Fear &amp; Greed</span>
-              <strong>
-                {macroSignals.fearGreedScore !== null
-                  ? macroSignals.fearGreedScore
-                  : "--"}
-              </strong>
-              <p>{macroSignals.fearGreedLabel}</p>
-            </div>
-            <div className="macro-item">
-              <span>Funding rates</span>
-              <strong>
-                {Number.isFinite(macroSignals.fundingRate)
-                  ? formatPct(macroSignals.fundingRate)
-                  : "--"}
-              </strong>
-              <p>{macroSignals.fundingLabel}</p>
-            </div>
-            <div className="macro-item">
-              <span>Dominance BTC / ETH</span>
-              <strong>
-                {Number.isFinite(macroSignals.btcDominance) &&
-                Number.isFinite(macroSignals.ethDominance)
-                  ? `${macroSignals.btcDominance.toFixed(1)}% / ${macroSignals.ethDominance.toFixed(1)}%`
-                  : "--"}
-              </strong>
-              <p>{macroSignals.dominanceLabel}</p>
-            </div>
-            <div className="macro-item">
-              <span>Open interest agrégé</span>
-              <strong>
-                {Number.isFinite(macroSignals.openInterest)
-                  ? formatCompact(macroSignals.openInterest, {
-                      style: "currency",
-                      currency: "USD",
-                    })
-                  : "--"}
-              </strong>
-              <p>
-                Par rapport a{" "}
-                {totalValue
-                  ? formatMoney(totalValue)
-                  : "un portefeuille neutre"}
-              </p>
-            </div>
-          </div>
-
-          <div className="heatmap-head">
-            <p className="eyebrow">Heatmap sectorielle</p>
-            <small>Variation moyenne 24h</small>
-          </div>
-          <div className="sector-heatmap">
-            {sectorHeatmap.length ? (
-              sectorHeatmap.map((sector) => (
-                <div
-                  key={sector.category}
-                  className={`heatmap-chip ${sector.avgChange >= 0 ? "up" : "down"}`}
-                  style={{
-                    opacity:
-                      sector.weight && primaryHeatmapWeight
-                        ? Math.max(
-                            0.55,
-                            (sector.weight / primaryHeatmapWeight) * 0.45 +
-                              0.55,
-                          )
-                        : 0.75,
-                  }}
-                >
-                  <span>{sector.category}</span>
-                  <strong>{formatPct(sector.avgChange)}</strong>
-                </div>
-              ))
-            ) : (
-              <p className="empty">Heatmap en cours...</p>
-            )}
-          </div>
-        </article>
-
-        <article className="card news-panel">
-          <div className="news-panel-head">
-            <div>
-              <p className="eyebrow">News &amp; Research</p>
-              <h3>Flux RSS · Twitter · Glassnode</h3>
-            </div>
-            <span className="badge badge-muted">Beta</span>
-          </div>
-
-          <div className="news-tags">
-            {NEWS_TAGS.map((tag) => (
-              <button
-                key={tag.key}
-                type="button"
-                className={`tag-pill ${newsFilter === tag.key ? "active" : ""}`}
-                onClick={() => setNewsFilter(tag.key)}
-              >
-                {tag.label}
-              </button>
-            ))}
-          </div>
-
-          <div className="news-feed">
-            {filteredResearch.map((item) => (
-              <div key={item.id} className="news-item">
-                <div className="news-item-meta">
-                  <span className="news-source">{item.source}</span>
-                  <span>{item.time}</span>
-                </div>
-                <div className="news-item-body">
-                  <strong>{item.title}</strong>
-                  <p>{item.summary}</p>
-                </div>
-                <span className={`news-tag tag-${item.tag}`}>
-                  {NEWS_TAGS.find((tag) => tag.key === item.tag)?.label ||
-                    item.tag}
+          <section className="intel-cluster reveal delay-3">
+            <article className="card stats-panel market-context">
+              <div className="heatmap-head">
+                <p className="eyebrow">Contexte marche</p>
+                <span className={`badge ${macroStatus === "error" ? "badge-danger" : "badge-muted"}`}>
+                  {macroStatus === "loading" || macroStatus === "refreshing"
+                    ? "Sync macro..."
+                    : macroMeta?.cached
+                      ? "Cache API"
+                      : "API live"}
                 </span>
               </div>
-            ))}
-            {filteredResearch.length === 0 && (
-              <p className="empty">Aucune publication pour ce tag.</p>
-            )}
-          </div>
-        </article>
-      </section>
+              {macroError && (
+                <p className="error-text">Macro: {macroError.message}</p>
+              )}
+              {macroMeta?.errors?.length > 0 && (
+                <p className="helper-text">
+                  {macroMeta.errors.length} source(s) macro indisponible(s).
+                </p>
+              )}
+              <div className="macro-grid">
+                <div className="macro-item">
+                  <span>Fear &amp; Greed</span>
+                  <strong>
+                    {macroSignals.fearGreedScore !== null
+                      ? macroSignals.fearGreedScore
+                      : "--"}
+                  </strong>
+                  <p>{macroSignals.fearGreedLabel}</p>
+                </div>
+                <div className="macro-item">
+                  <span>Funding rates</span>
+                  <strong>
+                    {Number.isFinite(macroSignals.fundingRate)
+                      ? formatPct(macroSignals.fundingRate)
+                      : "--"}
+                  </strong>
+                  <p>{macroSignals.fundingLabel}</p>
+                </div>
+                <div className="macro-item">
+                  <span>Dominance BTC / ETH</span>
+                  <strong>
+                    {Number.isFinite(macroSignals.btcDominance) &&
+                    Number.isFinite(macroSignals.ethDominance)
+                      ? `${macroSignals.btcDominance.toFixed(1)}% / ${macroSignals.ethDominance.toFixed(1)}%`
+                      : "--"}
+                  </strong>
+                  <p>{macroSignals.dominanceLabel}</p>
+                </div>
+                <div className="macro-item">
+                  <span>Open interest agrege</span>
+                  <strong>
+                    {Number.isFinite(macroSignals.openInterest)
+                      ? formatCompact(macroSignals.openInterest, {
+                          style: "currency",
+                          currency: "USD",
+                        })
+                      : "--"}
+                  </strong>
+                  <p>
+                    Par rapport a{" "}
+                    {totalValue
+                      ? formatMoney(totalValue)
+                      : "un portefeuille neutre"}
+                  </p>
+                </div>
+              </div>
+
+              <div className="heatmap-head">
+                <p className="eyebrow">Heatmap sectorielle</p>
+                <small>Variation moyenne 24h</small>
+              </div>
+              <div className="sector-heatmap">
+                {sectorHeatmap.length ? (
+                  sectorHeatmap.map((sector) => (
+                    <div
+                      key={sector.category}
+                      className={`heatmap-chip ${sector.avgChange >= 0 ? "up" : "down"}`}
+                      style={{
+                        opacity:
+                          sector.weight && primaryHeatmapWeight
+                            ? Math.max(
+                                0.55,
+                                (sector.weight / primaryHeatmapWeight) * 0.45 +
+                                  0.55,
+                              )
+                            : 0.75,
+                      }}
+                    >
+                      <span>{sector.category}</span>
+                      <strong>{formatPct(sector.avgChange)}</strong>
+                    </div>
+                  ))
+                ) : (
+                  <p className="empty">Heatmap en cours...</p>
+                )}
+              </div>
+            </article>
+
+            <article className="card news-panel">
+              <div className="news-panel-head">
+                <div>
+                  <p className="eyebrow">News &amp; Research</p>
+                  <h3>Flux RSS crypto</h3>
+                </div>
+                <span className={`badge ${researchStatus === "error" ? "badge-danger" : "badge-muted"}`}>
+                  {researchStatus === "loading" || researchStatus === "refreshing"
+                    ? "Sync..."
+                    : researchMeta?.cached
+                      ? "Cache RSS"
+                      : "RSS live"}
+                </span>
+              </div>
+
+              <div className="news-tags">
+                {NEWS_TAGS.map((tag) => (
+                  <button
+                    key={tag.key}
+                    type="button"
+                    className={`tag-pill ${newsFilter === tag.key ? "active" : ""}`}
+                    onClick={() => setNewsFilter(tag.key)}
+                  >
+                    {tag.label}
+                  </button>
+                ))}
+              </div>
+
+              {researchError && (
+                <p className="error-text">Research: {researchError.message}</p>
+              )}
+              {researchMeta?.errors?.length > 0 && (
+                <p className="helper-text">
+                  {researchMeta.errors.length} source(s) RSS indisponible(s).
+                </p>
+              )}
+
+              <div className="news-feed">
+                {filteredResearch.map((item) => (
+                  <button
+                    key={item.id}
+                    type="button"
+                    className="news-item"
+                    onClick={() => {
+                      if (item.url) {
+                        window.open(item.url, "_blank", "noopener,noreferrer");
+                      }
+                    }}
+                  >
+                    <div className="news-item-body">
+                      <strong>{item.title}</strong>
+                      <p>{item.summary}</p>
+                    </div>
+                    <div className="news-item-meta">
+                      <span className="news-source">{item.source}</span>
+                      <span>{item.time}</span>
+                      <span className={`news-tag tag-${item.tag}`}>
+                        {NEWS_TAGS.find((tag) => tag.key === item.tag)?.label ||
+                          item.tag}
+                      </span>
+                    </div>
+                  </button>
+                ))}
+                {filteredResearch.length === 0 && (
+                  <p className="empty">
+                    {researchStatus === "loading"
+                      ? "Chargement des flux RSS..."
+                      : "Aucune publication pour ce tag."}
+                  </p>
+                )}
+              </div>
+            </article>
+          </section>
+        </div>
+
+        <aside className="dashboard-side">
+          <WatchlistPanel
+              watchlist={watchlist}
+              coins={coins}
+              onSelect={setSelected}
+            />
+          <AlertsPanel
+              alerts={alerts}
+              alertEvents={alertEvents}
+              alertsError={alertsError}
+              isAlertsSyncing={isAlertsSyncing}
+              refreshAlerts={refreshAlerts}
+              runAlertCheck={handleRunAlertCheck}
+              alertName={alertName}
+              setAlertName={setAlertName}
+              alertSymbol={alertSymbol}
+              setAlertSymbol={setAlertSymbol}
+              selectionUniverse={selectionUniverse}
+              alertNote={alertNote}
+              setAlertNote={setAlertNote}
+              alertChannel={alertChannel}
+              setAlertChannel={setAlertChannel}
+              conditionDefinitions={CONDITION_DEFINITIONS}
+              conditionState={conditionState}
+              toggleCondition={toggleCondition}
+              updateConditionValue={updateConditionValue}
+              canSubmitAlert={canSubmitAlert}
+              isSubmittingAlert={isSubmittingAlert}
+              handleCreateAlert={handleCreateAlert}
+              handleDeleteAlert={handleDeleteAlert}
+              formatConditionPreview={formatConditionPreview}
+            />
+          <PortfolioCard
+              totalValue={totalValue}
+              sentiment={sentiment}
+              allocation={allocation}
+              holdings={holdings}
+          />
+        </aside>
+      </div>
+
     </>
   );
 }
+
