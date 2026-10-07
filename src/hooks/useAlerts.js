@@ -1,8 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 
-const SUPABASE_URL = process.env.REACT_APP_SUPABASE_URL;
-const SUPABASE_KEY = process.env.REACT_APP_SUPABASE_ANON_KEY;
-const SUPABASE_TABLE = process.env.REACT_APP_SUPABASE_ALERTS_TABLE || "alerts";
 const FALLBACK_ENDPOINT = process.env.REACT_APP_ALERTS_ENDPOINT || "/api/alerts";
 
 function parseConditions(raw) {
@@ -27,19 +24,18 @@ function normalizeRecord(record) {
   };
 }
 
-export default function useAlerts({ symbol, endpoint: endpointOverride } = {}) {
+function createClientId(prefix) {
+  return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+export default function useAlerts({ symbol, endpoint: endpointOverride, userId, authToken } = {}) {
   const [alerts, setAlerts] = useState([]);
   const [events, setEvents] = useState([]);
   const [status, setStatus] = useState("idle");
   const [error, setError] = useState(null);
   const [refreshTick, setRefreshTick] = useState(0);
 
-  const isSupabaseReady = Boolean(SUPABASE_URL && SUPABASE_KEY);
-
-  const endpoint = useMemo(() => {
-    if (endpointOverride) return endpointOverride;
-    return isSupabaseReady ? `${SUPABASE_URL}/rest/v1/${SUPABASE_TABLE}` : FALLBACK_ENDPOINT;
-  }, [endpointOverride, isSupabaseReady]);
+  const endpoint = endpointOverride || FALLBACK_ENDPOINT;
 
   const eventsEndpoint = useMemo(() => {
     if (endpointOverride?.includes("/api/alerts")) {
@@ -52,39 +48,33 @@ export default function useAlerts({ symbol, endpoint: endpointOverride } = {}) {
     const base = {
       "Content-Type": "application/json",
     };
-    if (isSupabaseReady) {
-      base.apikey = SUPABASE_KEY;
-      base.Authorization = `Bearer ${SUPABASE_KEY}`;
-      base.Prefer = "return=representation";
-    }
+    if (authToken) base.Authorization = `Bearer ${authToken}`;
     return base;
-  }, [isSupabaseReady]);
+  }, [authToken]);
 
   const buildListUrl = useCallback(() => {
-    if (isSupabaseReady) {
-      const params = new URLSearchParams({ select: "*" });
-      if (symbol) {
-        params.append("symbol", `eq.${symbol}`);
-      }
-      return `${endpoint}?${params.toString()}`;
-    }
+    const params = new URLSearchParams();
     if (symbol) {
-      const params = new URLSearchParams({ symbol });
-      return `${endpoint}?${params.toString()}`;
+      params.append("symbol", symbol);
     }
-    return endpoint;
-  }, [endpoint, isSupabaseReady, symbol]);
+    if (userId) {
+      params.append("user_id", userId);
+    }
+    const query = params.toString();
+    return query ? `${endpoint}?${query}` : endpoint;
+  }, [endpoint, symbol, userId]);
 
   const refresh = useCallback(() => {
     setRefreshTick((tick) => tick + 1);
   }, []);
 
-  const fetchAlerts = useCallback(async () => {
+  const fetchAlerts = useCallback(async (signal) => {
+    if (!authToken || !userId) { setAlerts([]); setStatus("idle"); setError(null); return; }
     setStatus((prev) => (prev === "ready" ? "refreshing" : "loading"));
     setError(null);
     try {
       const response = await fetch(buildListUrl(), {
-        headers,
+        headers, signal,
       });
       if (!response.ok && response.status !== 204) {
         throw new Error(`Alerts API ${response.status}`);
@@ -95,46 +85,63 @@ export default function useAlerts({ symbol, endpoint: endpointOverride } = {}) {
         : Array.isArray(payload?.data)
           ? payload.data.map(normalizeRecord)
           : [];
+      if (signal?.aborted) return;
       setAlerts(normalized);
       setStatus("ready");
     } catch (err) {
+      if (signal?.aborted) return;
       console.error("[useAlerts] fetch error", err);
       setError(err instanceof Error ? err : new Error("Alerts API error"));
       setStatus("error");
     }
-  }, [buildListUrl, headers]);
+  }, [buildListUrl, headers, authToken, userId]);
 
-  const fetchEvents = useCallback(async () => {
+  const fetchEvents = useCallback(async (signal) => {
+    if (!authToken || !userId) { setEvents([]); return; }
     try {
       const eventUrl = symbol
-        ? `${eventsEndpoint}?${new URLSearchParams({ symbol }).toString()}`
+        ? `${eventsEndpoint}?${new URLSearchParams({
+            symbol,
+            ...(userId ? { user_id: userId } : {}),
+          }).toString()}`
+        : userId
+          ? `${eventsEndpoint}?${new URLSearchParams({ user_id: userId }).toString()}`
         : eventsEndpoint;
       const response = await fetch(eventUrl, {
-        headers: { Accept: "application/json" },
+        signal,
+        headers: {
+          Accept: "application/json",
+          ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
+        },
       });
       if (!response.ok && response.status !== 204) {
         throw new Error(`Alert events API ${response.status}`);
       }
       const payload = response.status === 204 ? [] : await response.json();
-      setEvents(Array.isArray(payload) ? payload : []);
+      if (!signal?.aborted) setEvents(Array.isArray(payload) ? payload : []);
     } catch (err) {
-      console.error("[useAlerts] events fetch error", err);
+      if (!signal?.aborted) console.error("[useAlerts] events fetch error", err);
     }
-  }, [eventsEndpoint, symbol]);
+  }, [eventsEndpoint, symbol, userId, authToken]);
 
   useEffect(() => {
-    fetchAlerts();
-    fetchEvents();
+    const controller = new AbortController();
+    setAlerts([]); setEvents([]);
+    fetchAlerts(controller.signal);
+    fetchEvents(controller.signal);
+    return () => controller.abort();
   }, [fetchAlerts, fetchEvents, refreshTick]);
 
   const createAlert = useCallback(
     async (payload) => {
       const body = {
+        id: payload.id || createClientId("alert"),
         ...payload,
+        user_id: payload.user_id || userId || null,
         created_at: new Date().toISOString(),
       };
       try {
-        const response = await fetch(endpoint + (isSupabaseReady ? "" : ""), {
+        const response = await fetch(endpoint, {
           method: "POST",
           headers,
           body: JSON.stringify(body),
@@ -162,14 +169,14 @@ export default function useAlerts({ symbol, endpoint: endpointOverride } = {}) {
         throw err instanceof Error ? err : new Error("Impossible de creer l'alerte");
       }
     },
-    [endpoint, headers, isSupabaseReady, refresh]
+    [endpoint, headers, refresh, userId]
   );
 
   const deleteAlert = useCallback(
     async (id) => {
       if (!id) return;
       try {
-        const deleteUrl = isSupabaseReady ? `${endpoint}?id=eq.${id}` : `${endpoint}/${id}`;
+        const deleteUrl = `${endpoint}/${encodeURIComponent(id)}`;
         const response = await fetch(deleteUrl, {
           method: "DELETE",
           headers,
@@ -183,13 +190,13 @@ export default function useAlerts({ symbol, endpoint: endpointOverride } = {}) {
         throw err instanceof Error ? err : new Error("Suppression impossible");
       }
     },
-    [endpoint, headers, isSupabaseReady]
+    [endpoint, headers]
   );
 
   const runCheck = useCallback(async () => {
     const response = await fetch("/api/alerts/check", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${authToken}` },
     });
     if (!response.ok) {
       throw new Error(`Alert worker ${response.status}`);
@@ -197,7 +204,7 @@ export default function useAlerts({ symbol, endpoint: endpointOverride } = {}) {
     const result = await response.json();
     refresh();
     return result;
-  }, [refresh]);
+  }, [refresh, authToken]);
 
   return {
     alerts,

@@ -1,0 +1,8 @@
+Terminal :
+
+cd C:\Users\menez\Desktop\DEVS\Cryptoline-main
+
+Npm start
+
+
+

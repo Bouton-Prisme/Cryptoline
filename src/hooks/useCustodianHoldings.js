@@ -2,7 +2,13 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 
 const DEFAULT_ENDPOINT = process.env.REACT_APP_CUSTODY_ENDPOINT || "/api/custody";
 
-export default function useCustodianHoldings({ account, symbols = [], endpoint } = {}) {
+export default function useCustodianHoldings({
+  account,
+  symbols = [],
+  endpoint,
+  userId,
+  authToken,
+} = {}) {
   const [positions, setPositions] = useState([]);
   const [holdingsMap, setHoldingsMap] = useState(null);
   const [status, setStatus] = useState("idle");
@@ -21,13 +27,16 @@ export default function useCustodianHoldings({ account, symbols = [], endpoint }
   useEffect(() => {
     const custodyEndpoint = endpoint || DEFAULT_ENDPOINT;
 
-    if (!custodyEndpoint) {
+    if (!custodyEndpoint || !authToken || !userId) {
       setPositions([]);
       setHoldingsMap(null);
       setStatus("idle");
+      setError(null);
       return;
     }
 
+    setPositions([]);
+    setHoldingsMap(null);
     let cancelled = false;
     const controller = new AbortController();
 
@@ -37,9 +46,13 @@ export default function useCustodianHoldings({ account, symbols = [], endpoint }
       try {
         const params = new URLSearchParams();
         if (account) params.append("account", account);
+        if (userId) params.append("user_id", userId);
         if (normalizedSymbols.length) params.append("symbols", normalizedSymbols.join(","));
         const response = await fetch(`${custodyEndpoint}?${params.toString()}`, {
-          headers: { Accept: "application/json" },
+          headers: {
+            Accept: "application/json",
+            ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
+          },
           signal: controller.signal,
         });
         if (!response.ok) {
@@ -70,7 +83,7 @@ export default function useCustodianHoldings({ account, symbols = [], endpoint }
           .filter(Boolean);
 
         const holdings = sanitized.reduce((acc, position) => {
-          acc[position.symbol] = position.amount;
+          acc[position.symbol] = (acc[position.symbol] || 0) + position.amount;
           return acc;
         }, {});
 
@@ -92,7 +105,7 @@ export default function useCustodianHoldings({ account, symbols = [], endpoint }
       cancelled = true;
       controller.abort();
     };
-  }, [account, endpoint, normalizedSymbols, refreshTick]);
+  }, [account, authToken, endpoint, normalizedSymbols, refreshTick, userId]);
 
   return {
     positions,

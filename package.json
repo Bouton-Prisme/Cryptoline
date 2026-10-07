@@ -25,7 +25,9 @@
     "start:api": "node server/index.js",
     "build": "cross-env NODE_OPTIONS=--openssl-legacy-provider GENERATE_SOURCEMAP=false react-scripts build",
     "test": "cross-env NODE_OPTIONS=--openssl-legacy-provider react-scripts test",
-    "eject": "react-scripts eject"
+    "eject": "react-scripts eject",
+    "test:api": "node --test server/*.test.js",
+    "check:config": "node scripts/check-config.js"
   },
   "browserslist": {
     "production": [

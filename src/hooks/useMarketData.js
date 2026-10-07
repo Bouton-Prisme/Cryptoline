@@ -1,3 +1,4 @@
+import { parseMarketMessage } from "../lib/marketStream";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
@@ -32,7 +33,7 @@ export const MARKET_UNIVERSE = {
   XMR: {
     name: "Monero",
     coingeckoId: "monero",
-    binanceSymbol: "xmrusdt",
+    binanceSymbol: null,
     category: "Privacy",
     volatility: "Moyenne",
     swapToken: null,
@@ -77,14 +78,6 @@ function normalizeSparkline(prices) {
       value: Number(value),
     };
   });
-}
-
-function formatBook(entries) {
-  if (!Array.isArray(entries)) return [];
-  return entries.slice(0, 5).map(([price, size]) => ({
-    price: Number(price),
-    size: Number(size),
-  }));
 }
 
 function buildSymbolKey(symbols) {
@@ -220,80 +213,62 @@ export function useMarketData({
 
     const streams = pairs.flatMap((pair) => [`${pair}@miniTicker`, `${pair}@depth5@100ms`]);
     const url = `${STREAM_HOST}/stream?streams=${streams.join("/")}`;
-    const ws = new WebSocket(url);
-    wsRef.current = ws;
     let closed = false;
-
+    let retryTimer;
+    let retryDelay = 1000;
     const pairToSymbol = trackedSymbols.reduce((acc, symbol) => {
       const pair = MARKET_UNIVERSE[symbol]?.binanceSymbol;
-      if (pair) {
-        acc[pair.toUpperCase()] = symbol;
-      }
+      if (pair) acc[pair.toUpperCase()] = symbol;
       return acc;
     }, {});
 
-    ws.onopen = () => {
+    const connect = () => {
       if (closed) return;
-      setStreamStatus("connected");
-    };
-
-    ws.onerror = () => {
-      if (closed) return;
-      setStreamStatus("error");
-    };
-
-    ws.onclose = () => {
-      if (closed) return;
-      setStreamStatus("closed");
-    };
-
-    ws.onmessage = (event) => {
-      try {
-        const payload = JSON.parse(event.data);
-        if (!payload?.stream || !payload?.data) return;
-        const pair = payload.data.s?.toUpperCase();
-        const symbol = pair ? pairToSymbol[pair] : undefined;
-        if (!symbol) return;
-
-        if (payload.stream.includes("@miniticker")) {
-          const lastPrice = Number(payload.data.c);
-          const changePct = Number(payload.data.P);
-          const volume = Number(payload.data.v);
-          setSnapshot((prev) =>
-            prev.map((coin) =>
-              coin.symbol === symbol
-                ? {
-                    ...coin,
-                    price: Number.isFinite(lastPrice) ? lastPrice : coin.price,
-                    change24h: Number.isFinite(changePct) ? changePct : coin.change24h,
-                    volume24h: Number.isFinite(volume) ? volume : coin.volume24h,
-                  }
-                : coin
-            )
-          );
-        } else if (payload.stream.includes("@depth5")) {
-          setOrderBooks((prev) => ({
-            ...prev,
-            [symbol]: {
-              bids: formatBook(payload.data.bids),
-              asks: formatBook(payload.data.asks),
-              lastUpdateId: payload.data.lastUpdateId,
-            },
-          }));
+      setStreamStatus("connecting");
+      const ws = new WebSocket(url);
+      wsRef.current = ws;
+      ws.onopen = () => {
+        if (closed) return;
+        retryDelay = 1000;
+        setStreamStatus("connected");
+      };
+      ws.onerror = () => { if (!closed) ws.close(); };
+      ws.onclose = () => {
+        if (closed) return;
+        setStreamStatus("reconnecting");
+        setOrderBooks({});
+        retryTimer = setTimeout(connect, retryDelay);
+        retryDelay = Math.min(retryDelay * 2, 30000);
+      };
+      ws.onmessage = event => {
+        if (closed) return;
+        try {
+          const update = parseMarketMessage(JSON.parse(event.data), pairToSymbol);
+          if (!update) return;
+          if (update.type === "ticker") {
+            setSnapshot(prev => prev.map(coin => coin.symbol !== update.symbol ? coin : {
+              ...coin, price: update.price,
+              change24h: update.change24h ?? coin.change24h,
+              volume24h: update.volume24h ?? coin.volume24h,
+            }));
+            setLastUpdated(Date.now());
+          } else {
+            setOrderBooks(prev => ({ ...prev, [update.symbol]: {
+              bids: update.bids, asks: update.asks, lastUpdateId: update.lastUpdateId,
+            } }));
+          }
+        } catch (err) {
+          console.error("[useMarketData] WS parse error", err);
         }
-      } catch (err) {
-        console.error("[useMarketData] WS parse error", err);
-      }
+      };
     };
-
+    connect();
     return () => {
       closed = true;
-      setStreamStatus("closed");
+      clearTimeout(retryTimer);
       if (wsRef.current) {
         wsRef.current.close();
         wsRef.current = null;
-      } else {
-        ws.close();
       }
     };
   }, [trackedKey, trackedSymbols]);

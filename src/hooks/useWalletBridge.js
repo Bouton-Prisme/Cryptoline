@@ -45,6 +45,14 @@ const NATIVE_TOKEN_ADDRESSES = new Set([
   "0x0000000000000000000000000000000000000000",
 ]);
 
+const ZEROX_ALLOWED_SPENDERS = new Set([
+  "0x0000000000001ff3684f28c67538d4d072c22734",
+]);
+
+function normalizeAddress(value) {
+  return typeof value === "string" ? value.trim().toLowerCase() : "";
+}
+
 function toDecimalChainId(chainId) {
   if (!chainId) return DEFAULT_CHAIN_ID;
   if (typeof chainId === "number") return chainId;
@@ -103,7 +111,7 @@ async function readBalances(provider, account, symbols) {
   const nextBalances = {};
   const wanted = new Set((symbols || []).map((symbol) => symbol?.toUpperCase()).filter(Boolean));
 
-  if (wanted.has("ETH")) {
+  if (wanted.has("ETH") && [1, 42161, 8453].includes(chainId)) {
     const balance = await web3Provider.getBalance(account);
     nextBalances.ETH = Number(ethers.utils.formatEther(balance));
   }
@@ -307,9 +315,31 @@ export default function useWalletBridge({ symbols = [] } = {}) {
         throw new Error("Wallet non connecte.");
       }
 
+      const ensureFreshQuote = () => {
+        if (!quote?.expiresAt || Date.now() >= quote.expiresAt) {
+          throw new Error("Devis expire. Actualise le devis avant de signer.");
+        }
+      };
+      ensureFreshQuote();
+      const liveProvider = new ethers.providers.Web3Provider(provider, "any");
+      const liveNetwork = await liveProvider.getNetwork();
+      if (Number(liveNetwork.chainId) !== Number(quote.chainId)) throw new Error("Reseau du wallet incorrect.");
+      const activeAccounts = await provider.request({ method: "eth_accounts" });
+      if (normalizeAddress(activeAccounts?.[0]) !== normalizeAddress(account) || normalizeAddress(quote.metadata?.takerAddress) !== normalizeAddress(account)) {
+        throw new Error("Le compte du wallet a change. Actualise le devis.");
+      }
       const tx = quote?.transaction || quote;
       if (!tx?.to || !tx?.data) {
         throw new Error("Quote 0x incomplete: transaction manquante.");
+      }
+      const quoteChainId = toDecimalChainId(quote?.chainId || quote?.metadata?.chainId || chainId);
+      if (chainId && quoteChainId && Number(chainId) !== Number(quoteChainId)) {
+        throw new Error("Le wallet n'est pas sur le reseau attendu pour ce quote.");
+      }
+
+      const txTo = normalizeAddress(tx.to);
+      if (!ZEROX_ALLOWED_SPENDERS.has(txTo)) {
+        throw new Error("Transaction refusee: contrat 0x non autorise.");
       }
 
       const sellTokenAddress = (
@@ -318,12 +348,30 @@ export default function useWalletBridge({ symbols = [] } = {}) {
         quote?.metadata?.sellToken ||
         ""
       ).toLowerCase();
+      const expectedSellToken = normalizeAddress(quote?.metadata?.sellTokenAddress);
+      const buyTokenAddress = normalizeAddress(
+        quote?.buyTokenAddress ||
+          quote?.buyToken?.address ||
+          quote?.metadata?.buyTokenAddress ||
+          "",
+      );
+      const expectedBuyToken = normalizeAddress(quote?.metadata?.buyTokenAddress);
       const allowanceTarget = (
         quote?.allowanceTarget ||
         quote?.issues?.allowance?.spender ||
         ""
       ).toLowerCase();
       const sellAmount = quote?.sellAmount || quote?.metadata?.sellAmount;
+
+      if (expectedSellToken && normalizeAddress(sellTokenAddress) !== expectedSellToken) {
+        throw new Error("Transaction refusee: token vendu inattendu.");
+      }
+      if (expectedBuyToken && buyTokenAddress !== expectedBuyToken) {
+        throw new Error("Transaction refusee: token achete inattendu.");
+      }
+      if (allowanceTarget && !ZEROX_ALLOWED_SPENDERS.has(allowanceTarget)) {
+        throw new Error("Transaction refusee: spender non autorise.");
+      }
 
       if (
         sellTokenAddress &&
@@ -336,24 +384,28 @@ export default function useWalletBridge({ symbols = [] } = {}) {
         const currentAllowance = await token.allowance(account, allowanceTarget);
         const requiredAllowance = ethers.BigNumber.from(sellAmount);
         if (currentAllowance.lt(requiredAllowance)) {
-          const approvalData = token.interface.encodeFunctionData("approve", [
-            allowanceTarget,
-            requiredAllowance,
-          ]);
-          await provider.request({
-            method: "eth_sendTransaction",
-            params: [
-              {
-                from: account,
-                to: sellTokenAddress,
-                data: approvalData,
-                value: "0x0",
-              },
-            ],
-          });
+          const approve = async amount => {
+            const hash = await provider.request({
+              method: "eth_sendTransaction",
+              params: [{ from: account, to: sellTokenAddress,
+                data: token.interface.encodeFunctionData("approve", [allowanceTarget, amount]), value: "0x0" }],
+            });
+            const receipt = await web3Provider.waitForTransaction(hash, 1, 120000);
+            if (!receipt || receipt.status !== 1) throw new Error("Approbation du token non confirmee.");
+          };
+          // USDT and similar tokens require clearing a nonzero allowance first.
+          if (!currentAllowance.isZero()) await approve(0);
+          ensureFreshQuote();
+          await approve(requiredAllowance);
         }
       }
 
+      ensureFreshQuote();
+      const currentChain = await provider.request({ method: "eth_chainId" });
+      const currentAccounts = await provider.request({ method: "eth_accounts" });
+      if (Number(currentChain) !== Number(quote.chainId) || normalizeAddress(currentAccounts?.[0]) !== normalizeAddress(account)) {
+        throw new Error("Le compte ou le reseau du wallet a change.");
+      }
       const swapTx = {
         from: account,
         to: tx.to,
@@ -363,13 +415,19 @@ export default function useWalletBridge({ symbols = [] } = {}) {
 
       if (tx.gas) swapTx.gas = ethers.BigNumber.from(tx.gas).toHexString();
       if (tx.gasPrice) swapTx.gasPrice = ethers.BigNumber.from(tx.gasPrice).toHexString();
+      if (tx.maxFeePerGas) {
+        swapTx.maxFeePerGas = ethers.BigNumber.from(tx.maxFeePerGas).toHexString();
+      }
+      if (tx.maxPriorityFeePerGas) {
+        swapTx.maxPriorityFeePerGas = ethers.BigNumber.from(tx.maxPriorityFeePerGas).toHexString();
+      }
 
       return provider.request({
         method: "eth_sendTransaction",
         params: [swapTx],
       });
     },
-    [account],
+    [account, chainId],
   );
 
   useEffect(() => {

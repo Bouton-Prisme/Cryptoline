@@ -172,7 +172,7 @@ async function dispatchNotification(alert, event) {
   return deliveries;
 }
 
-async function runAlertCheck() {
+async function runAlertCheck(userId) {
   if (workerState.running) return { skipped: true, reason: "already_running" };
 
   workerState.running = true;
@@ -180,7 +180,7 @@ async function runAlertCheck() {
 
   try {
     const now = new Date();
-    const alerts = (await listRecords("alerts", { status: "active" })).filter((alert) => {
+    const alerts = (await listRecords("alerts", { status: "active", ...(userId ? { user_id: userId } : {}) })).filter((alert) => {
       return String(alert.status || "active") === "active" && canTrigger(alert, now.getTime());
     });
     const symbols = Array.from(new Set(alerts.map((alert) => normalizeSymbol(alert.symbol)).filter(Boolean)));
@@ -204,6 +204,7 @@ async function runAlertCheck() {
       const event = {
         id: createId("evt"),
         alert_id: alert.id,
+        user_id: alert.user_id || null,
         symbol,
         label: alert.label || `${symbol} alert`,
         channel: alert.channel || "push",

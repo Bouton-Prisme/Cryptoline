@@ -1,6 +1,0 @@
-
-PowerShell : cd C:\Users\menez\Desktop\Cryptoline-main
-
-
-Set-ExecutionPolicy -Scope Process Bypass
-npm start

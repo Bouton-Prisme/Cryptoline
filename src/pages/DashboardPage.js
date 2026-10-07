@@ -14,8 +14,11 @@ import useWalletBridge from "../hooks/useWalletBridge";
 import useCustodianHoldings from "../hooks/useCustodianHoldings";
 import useAlerts from "../hooks/useAlerts";
 import PortfolioCard from "../components/PortfolioCard";
+import { rememberTransaction } from "../lib/submittedTransactions";
+import DcaPendingPanel from "../components/DcaPendingPanel";
 import AlertsPanel from "../components/AlertsPanel";
 import WatchlistPanel from "../components/WatchlistPanel";
+import { useAuth } from "../context/AuthContext";
 import { useAppPreferences } from "../context/AppPreferencesContext";
 import { formatMoney, formatPct, formatCompact } from "../utils/formatters";
 
@@ -33,6 +36,102 @@ const DEFAULT_EXECUTIONS_ENDPOINT =
   process.env.REACT_APP_EXECUTIONS_ENDPOINT || "/api/execute-dca";
 const DEFAULT_DCA_SCHEDULE_ENDPOINT =
   process.env.REACT_APP_DCA_SCHEDULE_ENDPOINT || "/api/dca-plans";
+const DEFAULT_CHAIN_ID = 1;
+
+const DCA_TOKEN_REGISTRY = {
+  1: {
+    ETH: {
+      symbol: "ETH",
+      address: "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      decimals: 18,
+      native: true,
+    },
+    USDC: {
+      symbol: "USDC",
+      address: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+      decimals: 6,
+    },
+    USDT: {
+      symbol: "USDT",
+      address: "0xdAC17F958D2ee523a2206206994597C13D831ec7",
+      decimals: 6,
+    },
+    DAI: {
+      symbol: "DAI",
+      address: "0x6B175474E89094C44Da98b954EedeAC495271d0F",
+      decimals: 18,
+    },
+    WBTC: {
+      symbol: "WBTC",
+      address: "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599",
+      decimals: 8,
+    },
+  },
+  137: {
+    USDC: {
+      symbol: "USDC",
+      address: "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",
+      decimals: 6,
+    },
+    USDT: {
+      symbol: "USDT",
+      address: "0xc2132D05D31c914a87C6611C10748AEb04B58e8F",
+      decimals: 6,
+    },
+  },
+  42161: {
+    ETH: {
+      symbol: "ETH",
+      address: "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      decimals: 18,
+      native: true,
+    },
+    USDC: {
+      symbol: "USDC",
+      address: "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
+      decimals: 6,
+    },
+    USDT: {
+      symbol: "USDT",
+      address: "0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9",
+      decimals: 6,
+    },
+    WBTC: {
+      symbol: "WBTC",
+      address: "0x2f2a2543B76A4166549F7aaB2e75Bef0aefC5B0f",
+      decimals: 8,
+    },
+  },
+  8453: {
+    ETH: {
+      symbol: "ETH",
+      address: "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      decimals: 18,
+      native: true,
+    },
+    USDC: {
+      symbol: "USDC",
+      address: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+      decimals: 6,
+    },
+  },
+};
+
+function resolveDcaToken(token, chainId = DEFAULT_CHAIN_ID) {
+  const registry = DCA_TOKEN_REGISTRY[Number(chainId) || DEFAULT_CHAIN_ID] || {};
+  const symbol = String(token || "").trim().toUpperCase();
+  if (registry[symbol]) return registry[symbol];
+  const address = String(token || "").trim().toLowerCase();
+  return Object.values(registry).find((entry) => entry.address.toLowerCase() === address) || null;
+}
+
+function decimalToUnits(value, decimals) {
+  const normalized = String(value ?? "").trim().replace(",", ".");
+  if (!/^\d+(\.\d+)?$/.test(normalized)) return "0";
+  const [whole, fractional = ""] = normalized.split(".");
+  const paddedFractional = fractional.slice(0, decimals).padEnd(decimals, "0");
+  return `${whole}${paddedFractional}`.replace(/^0+(?=\d)/, "") || "0";
+}
 
 const CHART_RANGES = {
   "24h": { days: 1, label: "24h" },
@@ -138,6 +237,9 @@ function normalizeMarketChart(prices, range) {
 }
 
 export default function DashboardPage() {
+  const { session, user } = useAuth();
+  const userId = user?.id || null;
+  const authToken = session?.access_token || null;
   const {
     selected,
     setSelected,
@@ -188,6 +290,8 @@ export default function DashboardPage() {
     runCheck: runAlertCheck,
   } = useAlerts({
     endpoint: accountSettings.alertsEndpoint || undefined,
+    userId,
+    authToken,
   });
   const [alertSymbol, setAlertSymbol] = useState("BTC");
   const [alertName, setAlertName] = useState("");
@@ -199,7 +303,10 @@ export default function DashboardPage() {
     volume: { enabled: false, value: 25000000, touched: false },
     funding: { enabled: false, value: 0.03, touched: false },
   });
+  const [quoteRefreshTick, setQuoteRefreshTick] = useState(0);
   const [isSubmittingAlert, setIsSubmittingAlert] = useState(false);
+  const [walletSaveStatus, setWalletSaveStatus] = useState("idle");
+  const [walletSaveMessage, setWalletSaveMessage] = useState(null);
 
   useEffect(() => {
     if (!MARKET_UNIVERSE[selected]) {
@@ -335,6 +442,8 @@ export default function DashboardPage() {
     accountSettings.dcaExecutionEndpoint || DEFAULT_EXECUTIONS_ENDPOINT;
   const dcaScheduleEndpoint =
     accountSettings.dcaScheduleEndpoint || DEFAULT_DCA_SCHEDULE_ENDPOINT;
+  const dcaChainId = Number(walletChainId || DEFAULT_CHAIN_ID);
+  const dcaSellToken = resolveDcaToken(dcaBaseStable, dcaChainId);
 
   const {
     positions: custodianPositions,
@@ -347,6 +456,8 @@ export default function DashboardPage() {
     account: custodyAccount,
     symbols: trackedUniverse,
     endpoint: custodyEndpoint,
+    userId,
+    authToken,
   });
 
   const {
@@ -406,7 +517,7 @@ export default function DashboardPage() {
         const response = await fetch(
           `https://api.coingecko.com/api/v3/coins/${coingeckoId}/market_chart?${params.toString()}`,
           {
-            headers: { Accept: "application/json" },
+            headers: { Accept: "application/json", Authorization: `Bearer ${authToken}` },
             signal: controller.signal,
           },
         );
@@ -615,6 +726,11 @@ export default function DashboardPage() {
     );
   }, [coins, coinsMap, coin, dcaTargetSymbol]);
 
+  const dcaBuyToken = useMemo(() => {
+    const meta = MARKET_UNIVERSE[dcaTargetSymbol];
+    return meta?.swapToken ? resolveDcaToken(meta.swapToken, dcaChainId) : null;
+  }, [dcaTargetSymbol, dcaChainId]);
+
   const dcaPlanPreview = useMemo(() => {
     if (!dcaAmount || dcaAmount <= 0) {
       return { occurrences: 0, totalInvested: 0, projectedTokens: 0 };
@@ -655,6 +771,7 @@ export default function DashboardPage() {
 
   useEffect(() => {
     if (
+      !authToken || !walletAccount ||
       !dcaTargetSymbol ||
       !dcaAmount ||
       dcaAmount <= 0 ||
@@ -666,9 +783,9 @@ export default function DashboardPage() {
     }
 
     const meta = MARKET_UNIVERSE[dcaTargetSymbol];
-    if (!meta?.swapToken) {
+    if (!meta?.swapToken || !dcaBuyToken || !dcaSellToken) {
       setDcaQuote(null);
-      setDcaQuoteError(new Error("Actif non supporte pour l'execution 0x."));
+      setDcaQuoteError(new Error("Paire ou reseau non supporte pour l'execution 0x."));
       return undefined;
     }
 
@@ -680,26 +797,27 @@ export default function DashboardPage() {
       setDcaQuoteError(null);
       try {
         const params = new URLSearchParams({
-          sellToken: dcaBaseStable,
-          buyToken: meta.swapToken,
-          sellAmount: Math.round(Number(dcaAmount) * 1_000_000).toString(),
+          sellToken: dcaSellToken.address,
+          buyToken: dcaBuyToken.native ? dcaBuyToken.symbol : dcaBuyToken.address,
+          sellAmount: decimalToUnits(dcaAmount, dcaSellToken.decimals),
           slippagePercentage: (Number(dcaSlippage) / 100).toString(),
+          chainId: String(dcaChainId),
         });
         if (walletAccount) params.append("takerAddress", walletAccount);
-        if (walletChainId) params.append("chainId", String(walletChainId));
 
         const response = await fetch(
           `${ZEROX_QUOTE_ENDPOINT}?${params.toString()}`,
           {
-            headers: { Accept: "application/json" },
+            headers: { Accept: "application/json", Authorization: `Bearer ${authToken}` },
             signal: controller.signal,
           },
         );
         if (!response.ok) {
-          const message =
+          const failure = await response.json().catch(() => ({}));
+          const message = failure.error || (
             response.status === 404
               ? "Aucune route 0x disponible pour cet actif ou ce montant. Essaie un autre actif, augmente le montant ou desactive 0x."
-              : `Quote 0x indisponible (${response.status}). Reessaie plus tard ou verifie la paire selectionnee.`;
+              : `Quote 0x indisponible (${response.status}). Reessaie plus tard ou verifie la paire selectionnee.`);
           throw new Error(message);
         }
         const payload = await response.json();
@@ -725,7 +843,7 @@ export default function DashboardPage() {
       cancelled = true;
       controller.abort();
     };
-  }, [dcaTargetSymbol, dcaAmount, dcaSlippage, dcaProvider, dcaBaseStable, walletAccount, walletChainId]);
+  }, [dcaTargetSymbol, dcaAmount, dcaSlippage, dcaProvider, dcaBuyToken, dcaSellToken, walletAccount, dcaChainId, authToken, quoteRefreshTick]);
 
   const custodyTargetPosition = custodyPositionMap[dcaTargetSymbol];
   const custodyAverageCost =
@@ -736,7 +854,18 @@ export default function DashboardPage() {
       : null;
 
   const availableStableBalance = walletBalances[dcaBaseStable] ?? 0;
-  const canExecuteDca = Boolean(walletAccount && dcaQuote && !isExecutingDca);
+  const canExecuteDca = Boolean(
+    userId && authToken &&
+    walletAccount && dcaQuote && dcaSellToken && dcaBuyToken && !isExecutingDca,
+  );
+  const canScheduleDca = Boolean(
+    userId && authToken &&
+    walletAccount &&
+      dcaPlanPreview.occurrences &&
+      dcaSellToken &&
+      dcaBuyToken &&
+      !isSchedulingDca,
+  );
 
   const activeAlertConditions = useMemo(() => {
     return CONDITION_DEFINITIONS.map((definition) => {
@@ -763,7 +892,7 @@ export default function DashboardPage() {
   }, [conditionState]);
 
   const canSubmitAlert = Boolean(
-    alertSymbol && activeAlertConditions.length && !isSubmittingAlert,
+    userId && authToken && alertSymbol && activeAlertConditions.length && !isSubmittingAlert,
   );
   const isAlertsSyncing =
     alertsStatus === "loading" || alertsStatus === "refreshing";
@@ -815,6 +944,7 @@ export default function DashboardPage() {
       channel: alertChannel,
       status: "active",
       conditions: activeAlertConditions,
+      user_id: userId,
     };
     try {
       setIsSubmittingAlert(true);
@@ -856,32 +986,81 @@ export default function DashboardPage() {
     }
   }
 
+  async function saveConnectedWalletToHub() {
+    if (!walletAccount || !userId) return;
+    setWalletSaveStatus("saving");
+    setWalletSaveMessage(null);
+    try {
+      const providerLabel =
+        walletConnectors.find((connector) => connector.id === walletConnectorId)?.label ||
+        walletConnectorId ||
+        "wallet";
+      const response = await fetch("/api/wallets", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
+        },
+        body: JSON.stringify({
+          user_id: userId,
+          name: `${providerLabel} ${walletNetwork || "EVM"}`,
+          wallet_type: "self-custody",
+          provider: walletConnectorId || "walletconnect",
+          address: walletAccount,
+          network: String(walletNetwork || "ethereum").toLowerCase(),
+          chain_family: "evm",
+          connection_status: "connected",
+          metadata: {
+            source: "dashboard-connected-wallet",
+            chainId: walletChainId,
+          },
+        }),
+      });
+      if (!response.ok) {
+        const payload = await response.json().catch(() => ({}));
+        throw new Error(payload?.error || `Wallet API ${response.status}`);
+      }
+      setWalletSaveMessage("Wallet enregistre dans le hub.");
+      setWalletSaveStatus("ready");
+    } catch (err) {
+      setWalletSaveMessage(err instanceof Error ? err.message : "Enregistrement impossible.");
+      setWalletSaveStatus("error");
+    }
+  }
+
   async function executeDcaNow() {
     if (!canExecuteDca || !dcaQuote) return;
     setDcaExecutionMessage(null);
     setIsExecutingDca(true);
+    let submittedHash = null;
     try {
       if (!sendSwapQuote) {
         throw new Error("Wallet incompatible avec l'execution de transaction.");
       }
       const payload = {
         account: walletAccount,
+        user_id: userId,
         connector: walletConnectorId,
         provider: dcaProvider,
         quote: dcaQuote,
         metadata: {
           targetSymbol: dcaTargetSymbol,
           sellToken: dcaQuote.sellTokenAddress,
+          sellTokenAddress: dcaQuote.sellTokenAddress,
           buyToken: dcaQuote.buyTokenAddress,
+          buyTokenAddress: dcaQuote.buyTokenAddress,
           sellAmount: dcaQuote.sellAmount,
           buyAmount: dcaQuote.buyAmount,
-          chainId: walletChainId,
+          chainId: dcaChainId,
         },
       };
 
       const response = await fetch(executionsEndpoint, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
+        },
         body: JSON.stringify(payload),
       });
       if (!response.ok) {
@@ -890,22 +1069,25 @@ export default function DashboardPage() {
       const prepared = await response.json();
       setDcaExecutionMessage("Ordre prepare. Signature wallet requise...");
 
-      const txHash = await sendSwapQuote({
-        ...dcaQuote,
-        metadata: payload.metadata,
-      });
+      const txHash = await sendSwapQuote(prepared.quote);
+      submittedHash = txHash;
+      rememberTransaction(prepared.id, txHash);
+      setDcaQuote(null);
 
       if (prepared?.id) {
-        await fetch(`/api/dca-executions/${prepared.id}`, {
+        const statusResponse = await fetch(`/api/dca-executions/${prepared.id}`, {
           method: "PATCH",
-          headers: { "Content-Type": "application/json" },
+          headers: {
+            "Content-Type": "application/json",
+            ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
+          },
           body: JSON.stringify({
             status: "submitted",
             tx_hash: txHash,
+            user_id: userId,
           }),
-        }).catch((err) => {
-          console.warn("[dca] execution status update failed", err);
         });
+        if (!statusResponse.ok) throw new Error("Statut non synchronise.");
       }
 
       setDcaExecutionMessage(`Transaction envoyee: ${txHash}`);
@@ -913,7 +1095,7 @@ export default function DashboardPage() {
     } catch (err) {
       console.error("[dca] execute error", err);
       setDcaExecutionMessage(
-        err instanceof Error ? err.message : "Execution impossible.",
+        submittedHash ? `Transaction envoyee : ${submittedHash}. Statut non synchronise ; ne la renvoie pas.` : (err instanceof Error ? err.message : "Execution impossible."),
       );
     } finally {
       setIsExecutingDca(false);
@@ -921,12 +1103,13 @@ export default function DashboardPage() {
   }
 
   async function scheduleDcaPlan() {
-    if (!walletAccount || !dcaPlanPreview.occurrences) return;
+    if (!canScheduleDca) return;
     setDcaScheduleMessage(null);
     setIsSchedulingDca(true);
     try {
       const payload = {
         account: walletAccount,
+        user_id: userId,
         provider: dcaProvider,
         symbol: dcaTargetSymbol,
         amountPerRun: dcaAmount,
@@ -934,10 +1117,17 @@ export default function DashboardPage() {
         occurrences: dcaPlanPreview.occurrences,
         startDate: dcaStartDate,
         slippage: dcaSlippage,
+        chainId: dcaChainId,
+        baseStable: dcaSellToken?.symbol || dcaBaseStable,
+        sellToken: dcaSellToken?.address,
+        buyToken: dcaBuyToken?.address,
       };
       const response = await fetch(dcaScheduleEndpoint, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
+        },
         body: JSON.stringify(payload),
       });
       if (!response.ok) {
@@ -1241,20 +1431,30 @@ export default function DashboardPage() {
                   <p>{walletNetwork || "Reseau non detecte"}</p>
                 </div>
                 {walletStatus === "connected" ? (
-                  <button
-                    type="button"
-                    className="primary-action"
-                    onClick={() => {
-                      refreshWallet();
-                      refreshCustody();
-                    }}
-                    disabled={
-                      custodyStatus === "loading" ||
-                      custodyStatus === "refreshing"
-                    }
-                  >
-                    Synchroniser
-                  </button>
+                  <div className="wallet-actions">
+                    <button
+                      type="button"
+                      className="ghost"
+                      onClick={saveConnectedWalletToHub}
+                      disabled={!userId || walletSaveStatus === "saving"}
+                    >
+                      {walletSaveStatus === "saving" ? "Enregistrement..." : "Enregistrer ce wallet"}
+                    </button>
+                    <button
+                      type="button"
+                      className="primary-action"
+                      onClick={() => {
+                        refreshWallet();
+                        refreshCustody();
+                      }}
+                      disabled={
+                        custodyStatus === "loading" ||
+                        custodyStatus === "refreshing"
+                      }
+                    >
+                      Synchroniser
+                    </button>
+                  </div>
                 ) : (
                   <button
                     type="button"
@@ -1281,6 +1481,11 @@ export default function DashboardPage() {
                     day: "2-digit",
                     month: "short",
                   })}
+                </p>
+              )}
+              {walletSaveMessage && (
+                <p className={walletSaveStatus === "error" ? "error-text" : "info-text"}>
+                  {walletSaveMessage}
                 </p>
               )}
 
@@ -1500,6 +1705,9 @@ export default function DashboardPage() {
 
               <div className="dca-section execution">
                 <h4>Execution</h4>
+                {!authToken && <p className="helper-text">Connecte ton compte dans Comptes pour utiliser le DCA.</p>}
+                <button type="button" className="ghost" disabled={!authToken || !walletAccount || isFetchingQuote || isExecutingDca}
+                  onClick={() => setQuoteRefreshTick(tick => tick + 1)}>Actualiser le devis</button>
                 <div>
                   {isFetchingQuote && (
                     <span className="badge badge-muted">Recherche du prix...</span>
@@ -1556,7 +1764,7 @@ export default function DashboardPage() {
                       type="button"
                       className="ghost"
                       onClick={scheduleDcaPlan}
-                      disabled={isSchedulingDca}
+                      disabled={!canScheduleDca}
                     >
                       {isSchedulingDca ? "Planification..." : "Programmer le plan"}
                     </button>
@@ -1566,6 +1774,8 @@ export default function DashboardPage() {
                 {dcaExecutionMessage && (
                   <p className="info-text">{dcaExecutionMessage}</p>
                 )}
+                <DcaPendingPanel authToken={authToken} walletAccount={walletAccount} sendSwapQuote={sendSwapQuote}
+                  refreshWallet={refreshWallet} refreshTick={dcaScheduleMessage} />
                 {dcaScheduleMessage && (
                   <p className="info-text">{dcaScheduleMessage}</p>
                 )}

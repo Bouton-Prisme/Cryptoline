@@ -5,6 +5,14 @@ const { createClient } = require("@supabase/supabase-js");
 const DATA_DIR = path.join(__dirname, "data");
 
 const STORES = {
+  wallets: {
+    file: path.join(DATA_DIR, "wallets.json"),
+    table: process.env.SUPABASE_WALLETS_TABLE || "wallets",
+  },
+  exchangeConnections: {
+    file: path.join(DATA_DIR, "exchange-connections.json"),
+    table: process.env.SUPABASE_EXCHANGE_CONNECTIONS_TABLE || "exchange_connections",
+  },
   alerts: {
     file: path.join(DATA_DIR, "alerts.json"),
     table: process.env.SUPABASE_ALERTS_TABLE || "alerts",
@@ -75,7 +83,8 @@ async function writeJsonStore(name, records) {
 
 async function listRecords(name, filters = {}) {
   if (!supabase) {
-    return readJsonStore(name);
+    const records = await readJsonStore(name);
+    return records.filter(record => Object.entries(filters).every(([key, value]) => value === undefined || value === null || value === "" || String(record[key]) === String(value)));
   }
 
   let query = supabase.from(STORES[name].table).select("*");
@@ -126,12 +135,15 @@ async function upsertRecord(name, record, conflictKey) {
   if (Array.isArray(conflictKey) && conflictKey.length) {
     let query = supabase.from(STORES[name].table).select("id");
     conflictKey.forEach((key) => {
-      query = query.eq(key, record[key]);
+      query =
+        record[key] === null || record[key] === undefined
+          ? query.is(key, null)
+          : query.eq(key, record[key]);
     });
     const { data: existing, error: selectError } = await query.maybeSingle();
     if (selectError) throw selectError;
     if (existing?.id) {
-      return updateRecord(name, existing.id, record);
+      return updateRecord(name, existing.id, { ...record, id: existing.id }, record.user_id);
     }
   }
 
@@ -145,26 +157,28 @@ async function upsertRecord(name, record, conflictKey) {
   return data;
 }
 
-async function deleteRecord(name, id) {
+async function deleteRecord(name, id, userId) {
   if (!supabase) {
     const records = await readJsonStore(name);
     await writeJsonStore(
       name,
-      records.filter((record) => record.id !== id),
+      records.filter((record) => record.id !== id || (userId && record.user_id !== userId)),
     );
     return;
   }
 
-  const { error } = await supabase.from(STORES[name].table).delete().eq("id", id);
+  let query = supabase.from(STORES[name].table).delete().eq("id", id);
+  if (userId) query = query.eq("user_id", userId);
+  const { error } = await query;
   if (error) throw error;
 }
 
-async function updateRecord(name, id, patch) {
+async function updateRecord(name, id, patch, userId) {
   if (!supabase) {
     const records = await readJsonStore(name);
     let updated = null;
     const nextRecords = records.map((record) => {
-      if (record.id !== id) return record;
+      if (record.id !== id || (userId && record.user_id !== userId)) return record;
       updated = {
         ...record,
         ...patch,
@@ -175,21 +189,44 @@ async function updateRecord(name, id, patch) {
     return updated;
   }
 
-  const { data, error } = await supabase
-    .from(STORES[name].table)
-    .update(patch)
-    .eq("id", id)
-    .select()
-    .single();
+  let query = supabase.from(STORES[name].table).update(patch).eq("id", id);
+  if (userId) query = query.eq("user_id", userId);
+  const { data, error } = await query.select().single();
   if (error) throw error;
   return data;
 }
 
+async function getUserIdFromAccessToken(accessToken) {
+  if (!supabase) throw Object.assign(new Error("Supabase authentication is not configured"), { status: 503 });
+  if (!accessToken) return null;
+  const { data, error } = await supabase.auth.getUser(accessToken);
+  if (error) {
+    const unavailable = !error.status || error.status >= 500 || error.name === "AuthRetryableFetchError";
+    throw Object.assign(new Error(unavailable ? "Supabase authentication is unavailable" : "Invalid or expired session"), { status: unavailable ? 503 : 401 });
+  }
+  return data?.user?.id || null;
+}
+
+async function checkStorageHealth() {
+  if (!supabase) return { ready: false, error: "Supabase is not configured" };
+  try {
+    for (const table of ["profiles", ...Object.values(STORES).map(store => store.table)]) {
+      const { error } = await supabase.from(table).select("id").limit(0).abortSignal(AbortSignal.timeout(5000));
+      if (error) return { ready: false, error: "Supabase unavailable or schema incomplete" };
+    }
+    return { ready: true };
+  } catch {
+    return { ready: false, error: "Supabase unavailable" };
+  }
+}
+
 module.exports = {
   isSupabaseEnabled,
+  checkStorageHealth,
   listRecords,
   insertRecord,
   upsertRecord,
   deleteRecord,
   updateRecord,
+  getUserIdFromAccessToken,
 };

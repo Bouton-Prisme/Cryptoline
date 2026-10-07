@@ -6,6 +6,7 @@ export default function WatchlistPanel({ watchlist, coins, onSelect }) {
   return (
     <article className="card watchlist-panel">
       <p className="eyebrow">Watchlist rapide</p>
+      <h3>Actifs suivis</h3>
       <div className="watchlist-grid">
         {watchlistCoins.map((item) => (
           <button key={item.symbol} type="button" onClick={() => onSelect(item.symbol)}>
